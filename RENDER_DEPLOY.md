@@ -16,7 +16,9 @@ Open your Web Service → **Environment**:
 |-----|--------|
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | **Entire contents** of the JSON file, as **one line** (minify with the command below) |
 | `GCLOUD_PROJECT` | `dapp-79473` |
-| `FIREBASE_STORAGE_BUCKET` | `dapp-79473.firebasestorage.app` |
+| `FIREBASE_STORAGE_BUCKET` | Optional. Your bucket is often `dapp-79473.firebasestorage.app` (see Storage in Console). The API tries that and `.appspot.com`. |
+
+**KYC “default credentials” on Render:** the server writes `FIREBASE_SERVICE_ACCOUNT_JSON` to a temp file and sets `GOOGLE_APPLICATION_CREDENTIALS` so **Cloud Storage** can download the selfie (Auth alone was not enough for GCS).
 
 Optional: `AWS_*` for Rekognition, or `KYC_DEV_APPROVE=1`.
 

@@ -1,17 +1,53 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import multer from 'multer';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import { getStorage } from 'firebase-admin/storage';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 
 dotenv.config();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/** Set during Firebase init — used to try both *.appspot.com and *.firebasestorage.app for KYC downloads. */
+let firebaseProjectId = 'dapp-79473';
+
+function kycStorageBucketCandidates() {
+  const env = process.env.FIREBASE_STORAGE_BUCKET?.trim();
+  const pid = firebaseProjectId;
+  // New projects often use *.firebasestorage.app (matches google-services storage_bucket).
+  const names = [env, `${pid}.firebasestorage.app`, `${pid}.appspot.com`].filter(Boolean);
+  return [...new Set(names)];
+}
+
+/** Client uploads to project default bucket; Admin SDK bucket id is often *.appspot.com even when google-services shows *.firebasestorage.app */
+async function downloadKycSelfie(uid) {
+  const objectPath = `users/${uid}/kyc/face.jpg`;
+  let lastErr = null;
+  for (const bucketName of kycStorageBucketCandidates()) {
+    try {
+      const file = getStorage().bucket(bucketName).file(objectPath);
+      const [exists] = await file.exists();
+      if (!exists) continue;
+      const [buf] = await file.download();
+      if (buf?.length) {
+        console.info(`[kyc] selfie from bucket ${bucketName}`);
+        return buf;
+      }
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[kyc] bucket ${bucketName}:`, e?.message || e);
+    }
+  }
+  if (lastErr) throw lastErr;
+  return null;
+}
 
 function resolveFirebaseCredentialsPath() {
   const placeholder = /path-to-service-account|placeholder/i;
@@ -52,23 +88,53 @@ function loadServiceAccountJson() {
 
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
+
+const kycSelfieUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 4 * 1024 * 1024 },
+});
 
 if (!getApps().length) {
+  // Cloud Storage (@google-cloud/storage) needs Application Default Credentials on Render.
+  // FIREBASE_SERVICE_ACCOUNT_JSON alone + cert() verifies Auth tokens but Storage often still
+  // looks for GOOGLE_APPLICATION_CREDENTIALS — write JSON to a temp file so GCS can auth.
+  const jsonEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  if (jsonEnv) {
+    try {
+      JSON.parse(jsonEnv);
+    } catch (e) {
+      console.error('[firebase] FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON');
+      throw e;
+    }
+    const tmpCred = join(tmpdir(), 'firebase-admin-credentials.json');
+    writeFileSync(tmpCred, jsonEnv, { encoding: 'utf8', mode: 0o600 });
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = tmpCred;
+  } else {
+    const fileCred = resolveFirebaseCredentialsPath();
+    if (fileCred) {
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = fileCred;
+    } else {
+      delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    }
+  }
+
   const sa = loadServiceAccountJson();
   const projectId =
     process.env.GCLOUD_PROJECT?.trim() ||
     sa?.project_id ||
     'dapp-79473';
-  delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  firebaseProjectId = projectId;
 
   const options = { projectId };
   if (sa) {
     options.credential = cert(sa);
   }
-  const storageBucket = process.env.FIREBASE_STORAGE_BUCKET;
-  if (storageBucket) options.storageBucket = storageBucket;
+  const storageBucket =
+    process.env.FIREBASE_STORAGE_BUCKET?.trim() || `${projectId}.firebasestorage.app`;
+  options.storageBucket = storageBucket;
   initializeApp(options);
+  console.info(`[firebase] project=${projectId} storageBucket=${storageBucket} adc=${!!process.env.GOOGLE_APPLICATION_CREDENTIALS}`);
   if (!sa) {
     console.warn(
       '[firebase] No service account: set FIREBASE_SERVICE_ACCOUNT_JSON on Render or add service-account.json locally. Auth will fail until then.',
@@ -158,109 +224,199 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
   }
 });
 
-// --- KYC: selfie in Storage users/{uid}/kyc/face.jpg + AWS Rekognition gender vs onboarding ---
+/** KYC from image bytes (Rekognition). No Cloud Storage read — works without GCS IAM on the server. */
+async function runKycFromBuffer(uid, buffer, res) {
+  if (buffer.length > 5 * 1024 * 1024) {
+    return res.status(400).json({ error: 'Image too large.' });
+  }
+  if (buffer.length < 200) {
+    return res.status(400).json({ error: 'Image too small. Retake with better lighting.' });
+  }
+
+  const userSnap = await db.collection('users').doc(uid).get();
+  const data = userSnap.data() || {};
+  const stated = String(data.gender || '').trim();
+  if (!stated) {
+    return res.status(400).json({ error: 'Select your gender in onboarding first.' });
+  }
+
+  let verified = false;
+
+  if (process.env.KYC_DEV_APPROVE === '1') {
+    verified = true;
+  } else {
+    try {
+      const { RekognitionClient, DetectFacesCommand } = await import('@aws-sdk/client-rekognition');
+      const client = new RekognitionClient({
+        region: process.env.AWS_REGION || 'us-east-1',
+      });
+      const out = await client.send(
+        new DetectFacesCommand({
+          Image: { Bytes: buffer },
+          Attributes: ['ALL'],
+        }),
+      );
+      const face = out.FaceDetails?.[0];
+      if (!face) {
+        return res.status(400).json({
+          error: 'No face detected. Face the camera directly with good lighting.',
+        });
+      }
+      const detGender = String(face.Gender?.Value || '').toLowerCase();
+      const conf = face.Gender?.Confidence || 0;
+      const isNonBinary = /non-binary|nonbinary/i.test(stated);
+      const preferSkip = /prefer not/i.test(stated);
+
+      if (isNonBinary || preferSkip) {
+        verified = conf >= 75 && !!detGender;
+      } else if (/^male$/i.test(stated)) {
+        verified = detGender === 'male' && conf >= 82;
+      } else if (/^female$/i.test(stated)) {
+        verified = detGender === 'female' && conf >= 82;
+      } else {
+        verified = !!detGender && conf >= 78;
+      }
+
+      if (!verified) {
+        return res.status(400).json({
+          error:
+            'We could not confirm your photo matches the gender you selected during onboarding. Please retake a clear selfie.',
+        });
+      }
+    } catch (impErr) {
+      if (
+        impErr?.code === 'MODULE_NOT_FOUND' ||
+        String(impErr?.message || '').includes('Cannot find module')
+      ) {
+        return res.status(503).json({
+          error:
+            'KYC unavailable. Run npm install in backend, set AWS credentials for Rekognition, or KYC_DEV_APPROVE=1 for local dev.',
+        });
+      }
+      if (
+        impErr?.name === 'CredentialsProviderError' ||
+        impErr?.$metadata?.httpStatusCode === 403
+      ) {
+        return res.status(503).json({
+          error:
+            'AWS Rekognition not configured. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, or KYC_DEV_APPROVE=1.',
+        });
+      }
+      const ename = String(impErr?.name || '');
+      const emsg = String(impErr?.message || '');
+      if (
+        ename.includes('InvalidImage') ||
+        ename.includes('InvalidParameter') ||
+        /invalid image|image bytes|Request has invalid|malformed/i.test(emsg)
+      ) {
+        return res.status(400).json({
+          error:
+            'This photo could not be processed. Retake a clear, well-lit selfie (face the camera).',
+        });
+      }
+      throw impErr;
+    }
+  }
+
+  await db.collection('users').doc(uid).set(
+    {
+      kycVerified: true,
+      kycVerifiedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    { merge: true },
+  );
+  res.json({ verified: true });
+}
+
+// KYC: 1) raw JPEG body (octet-stream / image/jpeg) — most reliable on Render. 2) multipart selfie. 3) JSON base64. 4) Storage legacy.
 app.post('/api/kyc/verify', requireAuth, async (req, res) => {
   try {
     const uid = req.uid;
-    const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
-    if (!bucketName) {
-      return res.status(503).json({ error: 'FIREBASE_STORAGE_BUCKET not set on server' });
-    }
-    const bucket = getStorage().bucket(bucketName);
-    const filePath = `users/${uid}/kyc/face.jpg`;
-    const file = bucket.file(filePath);
-    const [exists] = await file.exists();
-    if (!exists) {
-      return res.status(400).json({ error: 'Selfie not found. Capture and upload from the app first.' });
-    }
-    const [buffer] = await file.download();
-    if (!buffer || buffer.length < 500) {
-      return res.status(400).json({ error: 'Image too small. Retake with better lighting.' });
-    }
+    const ct = (req.headers['content-type'] || '').toLowerCase();
+    const maxBytes = 4 * 1024 * 1024;
 
-    const userSnap = await db.collection('users').doc(uid).get();
-    const data = userSnap.data() || {};
-    const stated = String(data.gender || '').trim();
-    if (!stated) {
-      return res.status(400).json({ error: 'Select your gender in onboarding first.' });
-    }
-
-    let verified = false;
-
-    if (process.env.KYC_DEV_APPROVE === '1') {
-      verified = true;
-    } else {
+    if (
+      ct.includes('application/octet-stream') ||
+      ct.startsWith('image/jpeg') ||
+      ct.startsWith('image/jpg')
+    ) {
+      const chunks = [];
+      let n = 0;
       try {
-        const { RekognitionClient, DetectFacesCommand } = await import('@aws-sdk/client-rekognition');
-        const client = new RekognitionClient({
-          region: process.env.AWS_REGION || 'us-east-1',
-        });
-        const out = await client.send(
-          new DetectFacesCommand({
-            Image: { Bytes: buffer },
-            Attributes: ['ALL'],
-          }),
-        );
-        const face = out.FaceDetails?.[0];
-        if (!face) {
-          return res.status(400).json({
-            error: 'No face detected. Face the camera directly with good lighting.',
-          });
+        for await (const chunk of req) {
+          n += chunk.length;
+          if (n > maxBytes) {
+            return res.status(400).json({ error: 'Photo too large.' });
+          }
+          chunks.push(chunk);
         }
-        const detGender = String(face.Gender?.Value || '').toLowerCase();
-        const conf = face.Gender?.Confidence || 0;
-        const isNonBinary = /non-binary|nonbinary/i.test(stated);
-        const preferSkip = /prefer not/i.test(stated);
-
-        if (isNonBinary || preferSkip) {
-          verified = conf >= 75 && !!detGender;
-        } else if (/^male$/i.test(stated)) {
-          verified = detGender === 'male' && conf >= 82;
-        } else if (/^female$/i.test(stated)) {
-          verified = detGender === 'female' && conf >= 82;
-        } else {
-          verified = !!detGender && conf >= 78;
-        }
-
-        if (!verified) {
-          return res.status(400).json({
-            error:
-              'We could not confirm your photo matches the gender you selected during onboarding. Please retake a clear selfie.',
-          });
-        }
-      } catch (impErr) {
-        if (
-          impErr?.code === 'MODULE_NOT_FOUND' ||
-          String(impErr?.message || '').includes('Cannot find module')
-        ) {
-          return res.status(503).json({
-            error:
-              'KYC unavailable. Run npm install in backend, set AWS credentials for Rekognition, or KYC_DEV_APPROVE=1 for local dev.',
-          });
-        }
-        if (
-          impErr?.name === 'CredentialsProviderError' ||
-          impErr?.$metadata?.httpStatusCode === 403
-        ) {
-          return res.status(503).json({
-            error:
-              'AWS Rekognition not configured. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, or KYC_DEV_APPROVE=1.',
-          });
-        }
-        throw impErr;
+      } catch (readErr) {
+        console.error('[kyc] raw body read:', readErr);
+        return res.status(400).json({ error: 'Could not read photo data. Try again.' });
       }
+      const buf = Buffer.concat(chunks);
+      if (buf.length >= 200) {
+        console.info('[kyc] raw JPEG bytes=', buf.length);
+        return await runKycFromBuffer(uid, buf, res);
+      }
+      return res.status(400).json({
+        error: 'Photo data missing or too small. Update the app and retake your selfie.',
+      });
     }
 
-    await db.collection('users').doc(uid).set(
-      {
-        kycVerified: true,
-        kycVerifiedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      },
-      { merge: true },
-    );
-    res.json({ verified: true });
+    if (ct.includes('multipart/form-data')) {
+      await new Promise((resolve, reject) => {
+        kycSelfieUpload.single('selfie')(req, res, (err) => (err ? reject(err) : resolve()));
+      });
+      if (req.file?.buffer?.length >= 200) {
+        console.info('[kyc] multipart bytes=', req.file.buffer.length);
+        return await runKycFromBuffer(uid, req.file.buffer, res);
+      }
+      return res.status(400).json({ error: 'No photo in upload. Field name must be "selfie".' });
+    }
+
+    const b64 = req.body?.imageBase64;
+    if (typeof b64 === 'string' && b64.length > 200) {
+      let buffer;
+      try {
+        const raw = b64
+          .trim()
+          .replace(/^data:image\/\w+;base64,/, '')
+          .replace(/\s/g, '');
+        buffer = Buffer.from(raw, 'base64');
+      } catch {
+        return res.status(400).json({ error: 'Invalid base64 image.' });
+      }
+      if (buffer.length >= 200) {
+        console.info('[kyc] base64 bytes=', buffer.length);
+        return await runKycFromBuffer(uid, buffer, res);
+      }
+      if (buffer.length > 0) {
+        return res.status(400).json({ error: 'Image too small. Retake with better lighting.' });
+      }
+      return res.status(400).json({ error: 'Empty image.' });
+    }
+
+    let buffer;
+    try {
+      buffer = await downloadKycSelfie(uid);
+    } catch (storErr) {
+      console.error('[kyc] storage:', storErr);
+      return res.status(503).json({
+        error:
+          'No photo in this request. Update the app — it must send the selfie as the request body (JPEG).',
+      });
+    }
+    if (!buffer) {
+      return res.status(400).json({ error: 'Selfie not found in Storage.' });
+    }
+    return await runKycFromBuffer(uid, buffer, res);
   } catch (e) {
+    if (e?.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'Photo file is too large.' });
+    }
+    console.error('[kyc] verify error:', e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
@@ -314,6 +470,7 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
 });
 
 // --- Discovery (suggestions) ---
+// Optional query: gender = 'Male' | 'Female' | 'Transgender' to filter by profile gender.
 app.get('/api/discovery', requireAuth, async (req, res) => {
   try {
     const uid = req.uid;
@@ -322,12 +479,16 @@ app.get('/api/discovery', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Complete identity verification to use discovery.' });
     }
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 50);
-    // Only completed profiles; fetch extra then filter self (avoids != query + composite index issues).
-    const snapshot = await db
-      .collection('users')
-      .where('profileComplete', '==', true)
-      .limit(Math.min(limit + 15, 60))
-      .get();
+    const genderFilter = (req.query.gender || '').toString().trim();
+    const allowedGenders = ['Male', 'Female', 'Transgender', 'Non-binary', 'Prefer not to say'];
+    const gender = allowedGenders.includes(genderFilter) ? genderFilter : null;
+
+    let query = db.collection('users').where('profileComplete', '==', true);
+    if (gender) {
+      query = query.where('gender', '==', gender);
+    }
+    const snapshot = await query.limit(Math.min(limit + 15, 60)).get();
+
     const list = snapshot.docs
       .filter((d) => d.id !== uid)
       .slice(0, limit)
