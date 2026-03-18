@@ -224,7 +224,35 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
   }
 });
 
-/** KYC from image bytes (Rekognition). No Cloud Storage read — works without GCS IAM on the server. */
+/** Lazy-loaded Human for KYC gender detection (free, no API keys). Uses pure-JS JPEG decode, no native deps. */
+let _human = null;
+
+async function getHuman() {
+  if (_human) return _human;
+  const Human = (await import('@vladmandic/human')).default;
+  _human = new Human({
+    backend: 'cpu',
+    modelBasePath: 'https://cdn.jsdelivr.net/npm/@vladmandic/human/models/',
+    face: { enabled: true },
+    debug: false,
+  });
+  await _human.load();
+  return _human;
+}
+
+/** Decode JPEG buffer to tensor [1, height, width, 3] for Human (pure JS, no canvas). */
+async function bufferToTensor(buffer) {
+  const jpeg = await import('jpeg-js');
+  const { width, height, data } = jpeg.decode(buffer, { useTArray: true });
+  if (!data || width < 10 || height < 10) throw new Error('Invalid image');
+  const human = await getHuman();
+  return human.tf.tidy(() => {
+    const tensor = human.tf.tensor3d(data, [height, width, 3]).expandDims(0);
+    return human.tf.cast(tensor, 'float32');
+  });
+}
+
+/** KYC from image bytes using @vladmandic/human (free, local gender detection). No AWS. */
 async function runKycFromBuffer(uid, buffer, res) {
   if (buffer.length > 5 * 1024 * 1024) {
     return res.status(400).json({ error: 'Image too large.' });
@@ -246,24 +274,19 @@ async function runKycFromBuffer(uid, buffer, res) {
     verified = true;
   } else {
     try {
-      const { RekognitionClient, DetectFacesCommand } = await import('@aws-sdk/client-rekognition');
-      const client = new RekognitionClient({
-        region: process.env.AWS_REGION || 'us-east-1',
-      });
-      const out = await client.send(
-        new DetectFacesCommand({
-          Image: { Bytes: buffer },
-          Attributes: ['ALL'],
-        }),
-      );
-      const face = out.FaceDetails?.[0];
+      const human = await getHuman();
+      const tensor = await bufferToTensor(buffer);
+      const result = await human.detect(tensor);
+      tensor.dispose?.();
+      const face = result?.face?.[0];
       if (!face) {
         return res.status(400).json({
           error: 'No face detected. Face the camera directly with good lighting.',
         });
       }
-      const detGender = String(face.Gender?.Value || '').toLowerCase();
-      const conf = face.Gender?.Confidence || 0;
+      // Human: gender is 'male'|'female', genderScore 0..1
+      const detGender = String(face.gender || '').toLowerCase();
+      const conf = Math.round((face.genderScore ?? 0) * 100);
       const isNonBinary = /non-binary|nonbinary/i.test(stated);
       const preferSkip = /prefer not/i.test(stated);
 
@@ -289,32 +312,20 @@ async function runKycFromBuffer(uid, buffer, res) {
         String(impErr?.message || '').includes('Cannot find module')
       ) {
         return res.status(503).json({
-          error:
-            'KYC unavailable. Run npm install in backend, set AWS credentials for Rekognition, or KYC_DEV_APPROVE=1 for local dev.',
+          error: 'KYC unavailable. Run npm install in backend, or set KYC_DEV_APPROVE=1 for local dev.',
         });
       }
-      if (
-        impErr?.name === 'CredentialsProviderError' ||
-        impErr?.$metadata?.httpStatusCode === 403
-      ) {
-        return res.status(503).json({
-          error:
-            'AWS Rekognition not configured. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, or KYC_DEV_APPROVE=1.',
-        });
-      }
-      const ename = String(impErr?.name || '');
       const emsg = String(impErr?.message || '');
-      if (
-        ename.includes('InvalidImage') ||
-        ename.includes('InvalidParameter') ||
-        /invalid image|image bytes|Request has invalid|malformed/i.test(emsg)
-      ) {
+      if (/invalid image|decode|jpeg|png|image format/i.test(emsg)) {
         return res.status(400).json({
           error:
             'This photo could not be processed. Retake a clear, well-lit selfie (face the camera).',
         });
       }
-      throw impErr;
+      console.error('[kyc] human detect error:', impErr?.message || impErr);
+      return res.status(500).json({
+        error: 'Verification failed. Please retake a clear selfie and try again.',
+      });
     }
   }
 
@@ -471,13 +482,10 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
 
 // --- Discovery (suggestions) ---
 // Optional query: gender = 'Male' | 'Female' | 'Transgender' to filter by profile gender.
+// Discovery is allowed for all authenticated users; likes require identity verification.
 app.get('/api/discovery', requireAuth, async (req, res) => {
   try {
     const uid = req.uid;
-    const me = await db.collection('users').doc(uid).get();
-    if (!me.exists || !me.data().kycVerified) {
-      return res.status(403).json({ error: 'Complete identity verification to use discovery.' });
-    }
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 50);
     const genderFilter = (req.query.gender || '').toString().trim();
     const allowedGenders = ['Male', 'Female', 'Transgender', 'Non-binary', 'Prefer not to say'];
@@ -500,17 +508,44 @@ app.get('/api/discovery', requireAuth, async (req, res) => {
 });
 
 // --- Likes / passes ---
+// On mutual like (target has already liked us), create a match so both can chat.
 app.post('/api/likes', requireAuth, async (req, res) => {
   try {
+    const uid = req.uid;
+    const me = await db.collection('users').doc(uid).get();
+    if (!me.exists || !me.data().kycVerified) {
+      return res.status(403).json({ error: 'Complete identity verification to like profiles.' });
+    }
     const { targetId, superLike } = req.body;
     if (!targetId) return res.status(400).json({ error: 'targetId required' });
-    await db.collection('likes').doc(`${req.uid}_${targetId}`).set({
-      fromId: req.uid,
+    await db.collection('likes').doc(`${uid}_${targetId}`).set({
+      fromId: uid,
       toId: targetId,
       superLike: !!superLike,
       createdAt: new Date().toISOString(),
     });
-    res.json({ ok: true });
+
+    // Check for mutual like: target has already liked uid
+    const reverseLike = await db.collection('likes').doc(`${targetId}_${uid}`).get();
+    let isNewMatch = false;
+    let matchId = null;
+    if (reverseLike.exists) {
+      const matchParticipants = [uid, targetId].sort();
+      matchId = matchParticipants.join('_');
+      const matchRef = db.collection('matches').doc(matchId);
+      const matchDoc = await matchRef.get();
+      const now = new Date().toISOString();
+      if (!matchDoc.exists) {
+        await matchRef.set({
+          participants: matchParticipants,
+          createdAt: now,
+          updatedAt: now,
+          lastMessage: null,
+        });
+        isNewMatch = true;
+      }
+    }
+    res.json({ ok: true, isNewMatch, matchId });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -532,25 +567,63 @@ app.post('/api/passes', requireAuth, async (req, res) => {
 });
 
 // --- Matches ---
+// Return matches with otherUser (id, displayName, photos) for the participant that isn't current user.
 app.get('/api/matches', requireAuth, async (req, res) => {
   try {
+    const uid = req.uid;
     const snapshot = await db
       .collection('matches')
-      .where('participants', 'array-contains', req.uid)
+      .where('participants', 'array-contains', uid)
       .orderBy('updatedAt', 'desc')
       .limit(100)
       .get();
-    const list = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const list = await Promise.all(
+      snapshot.docs.map(async (d) => {
+        const data = d.data();
+        const participants = data.participants || [];
+        const otherId = participants.find((p) => p !== uid);
+        let otherUser = { id: otherId };
+        if (otherId) {
+          const userDoc = await db.collection('users').doc(otherId).get();
+          if (userDoc.exists) {
+            const u = userDoc.data();
+            otherUser = {
+              id: otherId,
+              displayName: u.displayName || 'Someone',
+              photos: u.photos || [],
+            };
+          }
+        }
+        return { id: d.id, ...data, otherUser };
+      })
+    );
     res.json({ matches: list });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// --- Chats ---
+// --- Chats --- (only match participants can read/send)
+async function getMatchAndRequireParticipant(req, res) {
+  const { matchId } = req.params;
+  const matchDoc = await db.collection('matches').doc(matchId).get();
+  if (!matchDoc.exists) {
+    res.status(404).json({ error: 'Match not found' });
+    return null;
+  }
+  const participants = matchDoc.data().participants || [];
+  if (!participants.includes(req.uid)) {
+    res.status(403).json({ error: 'You are not in this match' });
+    return null;
+  }
+  return { matchId, matchDoc };
+}
+
 app.get('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
   try {
-    const { matchId } = req.params;
+    const result = await getMatchAndRequireParticipant(req, res);
+    if (!result) return;
+    const { matchId } = result;
     const snapshot = await db
       .collection('matches')
       .doc(matchId)
@@ -567,20 +640,23 @@ app.get('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
 
 app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
   try {
-    const { matchId } = req.params;
+    const result = await getMatchAndRequireParticipant(req, res);
+    if (!result) return;
+    const { matchId } = result;
     const { text } = req.body;
     if (!text?.trim()) return res.status(400).json({ error: 'text required' });
     const ref = db.collection('matches').doc(matchId).collection('messages').doc();
+    const now = new Date().toISOString();
     await ref.set({
       senderId: req.uid,
       text: text.trim(),
-      createdAt: new Date().toISOString(),
+      createdAt: now,
     });
     await db.collection('matches').doc(matchId).update({
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
       lastMessage: text.trim().slice(0, 100),
     });
-    res.json({ id: ref.id, senderId: req.uid, text: text.trim() });
+    res.json({ id: ref.id, senderId: req.uid, text: text.trim(), createdAt: now });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
