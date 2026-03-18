@@ -1,6 +1,6 @@
 # Dating app backend (Spark API)
 
-Node.js + Express API for the Crossed dating app: Firebase Auth verification, Firestore, Storage, optional AWS Rekognition for KYC.
+Node.js + Express API for the Crossed dating app: Firebase Auth verification, Firestore, Storage, and KYC identity verification using free local gender detection (@vladmandic/human — no AWS).
 
 ## Prerequisites
 
@@ -25,8 +25,7 @@ npm run dev
 | `GCLOUD_PROJECT` | Firebase / GCP project ID |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to service account JSON |
 | `FIREBASE_STORAGE_BUCKET` | e.g. `your-project.appspot.com` |
-| `KYC_DEV_APPROVE=1` | Skip Rekognition in local dev |
-| `AWS_*` | For production KYC face gender check |
+| `KYC_DEV_APPROVE=1` | Skip face gender check in local dev (approve all selfies) |
 
 See `.env.example` for full list.
 
@@ -44,6 +43,18 @@ Set **`FIREBASE_SERVICE_ACCOUNT_JSON`** to the full service account JSON from Fi
 - `GET/POST /api/chats/:matchId/messages` — Chat
 - `POST /api/reports`, `POST /api/blocks` — Safety
 - KYC and rooms routes as implemented in `src/index.js`
+
+## Firestore indexes (Meetup)
+
+The Meetup (rooms) discovery query uses a composite index on `status` + `eventAt`. If you see **"The query requires an index"** in the app:
+
+1. From the **project root** (where `firebase.json` and `firestore.indexes.json` live), run:
+   ```bash
+   firebase deploy --only firestore:indexes
+   ```
+   (Requires [Firebase CLI](https://firebase.google.com/docs/cli) and `firebase use dapp-79473` or your project.)
+
+2. Or click the link in the error message in the app to create the index in Firebase Console. Wait until the index status is **Ready**, then tap **Retry** in the Meetup screen.
 
 ## Scripts
 

@@ -20,7 +20,7 @@ Open your Web Service → **Environment**:
 
 **KYC “default credentials” on Render:** the server writes `FIREBASE_SERVICE_ACCOUNT_JSON` to a temp file and sets `GOOGLE_APPLICATION_CREDENTIALS` so **Cloud Storage** can download the selfie (Auth alone was not enough for GCS).
 
-Optional: `AWS_*` for Rekognition, or `KYC_DEV_APPROVE=1`.
+KYC uses free local gender detection (@vladmandic/human); no AWS needed. Optional: `KYC_DEV_APPROVE=1` to skip verification in dev.
 
 ## 3. Redeploy
 
