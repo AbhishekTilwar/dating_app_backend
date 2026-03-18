@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "370994482685",
+    "project_id": "dapp-79473",
+    "storage_bucket": "dapp-79473.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:370994482685:android:b1d813e402850586885d94",
+        "android_client_info": {
+          "package_name": "com.spark.spark"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "370994482685-de0gedn7d34gk5emfdp43gj6dquguftn.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.spark.spark",
+            "certificate_hash": "723108088722c56bd63fb3bf0e5d3fbe19eaf9e8"
+          }
+        },
+        {
+          "client_id": "370994482685-68sik6lhdiqbt1k0ipu4km7nttjl5ld1.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn6zmsOko8vKySe8XCmaUsSx6_mRVTMXc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "370994482685-68sik6lhdiqbt1k0ipu4km7nttjl5ld1.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

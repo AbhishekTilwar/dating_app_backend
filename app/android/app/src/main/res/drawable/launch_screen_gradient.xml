@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Crossed native launch screen gradient: navy → blue -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="135"
+        android:startColor="@color/crossed_launch_navy"
+        android:endColor="@color/crossed_launch_blue"
+        android:type="linear" />
+</shape>

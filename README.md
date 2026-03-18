@@ -1,82 +1,62 @@
-# Dating app backend (Spark API)
+# Spark — Meaningful connections, designed for real life
 
-Node.js + Express API for the Crossed dating app: Firebase Auth verification, Firestore, Storage, and KYC identity verification using **@vladmandic/human** (local gender detection). On the server this pulls in **@tensorflow/tfjs-node** (declared in `package.json`) — without it, KYC fails with `Cannot find module '@tensorflow/tfjs-node'`.
+A modern dating app built with **Flutter** (Material 3) and **Firebase** (Auth, Firestore, Storage), with a **Node.js** backend. The design takes the best from Bumble and Hinge and addresses common dating-app pain points: safety, transparency, and conversation quality.
 
-## Prerequisites
+---
 
-- **Node.js** 18+
-- Firebase project (Firestore + Storage)
-- Service account JSON from Firebase Console → Project settings → Service accounts
+## What makes Spark different
 
-## Setup
+- **Designed to be deleted** — Focus on real connections, not endless scrolling (e.g. daily suggestion limits).
+- **You’re in control** — Relationship goals, dealbreakers, and optional “who makes the first move” (Bumble-style).
+- **Safe and transparent** — Report and block in 2–3 taps; verified profiles; clear community guidelines.
+- **Conversations that start well** — Prompts and “opening moves” (Bumble-style) so chats have a clear starting point.
+- **Light, friendly UI** — Material 3, light theme, clean layout, smooth transitions and scroll-triggered motion.
 
-```bash
-npm install
-cp .env.example .env
-# Edit .env: GCLOUD_PROJECT, GOOGLE_APPLICATION_CREDENTIALS, FIREBASE_STORAGE_BUCKET, etc.
-npm run dev
+---
+
+## Project structure
+
+```
+DatingApp/
+├── app/                 # Flutter app (Spark)
+│   ├── lib/
+│   │   ├── core/        # Theme, router, constants, services
+│   │   ├── features/   # Auth, onboarding, profile, discovery, matches, chat
+│   │   └── shared/     # Reusable widgets (e.g. parallax)
+│   └── pubspec.yaml
+├── backend/             # Node.js API
+│   ├── src/
+│   │   └── index.js    # Express + Firestore + Auth + Storage
+│   ├── package.json
+│   └── .env.example
+└── README.md
 ```
 
-## Environment variables
+---
 
-| Variable | Description |
-|----------|-------------|
-| `PORT` | Server port (default `8080`) |
-| `GCLOUD_PROJECT` | Firebase / GCP project ID |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Path to service account JSON |
-| `FIREBASE_STORAGE_BUCKET` | e.g. `your-project.appspot.com` |
-| `KYC_DEV_APPROVE=1` | Skip face gender check in local dev (approve all selfies) |
+## Features implemented
 
-See `.env.example` for full list.
+| Feature | Flutter | Backend |
+|--------|--------|--------|
+| Firebase Auth (phone + Google) | ✅ Sign in & sign up same flow, AuthService | ✅ `requireAuth` verifies ID token |
+| Onboarding | ✅ 4-step light copy | — |
+| Profile setup | ✅ Firestore + Storage, live stream on Profile tab | ✅ PUT /api/users/me, `profileComplete` |
+| Auth → home flow | ✅ Splash routes by `profileComplete` | ✅ Discovery only `profileComplete` users |
+| Discovery | ✅ Card stack, like/pass/super like, prompts on cards | ✅ GET /api/discovery, likes/passes |
+| Matches & chat | ✅ List, chat UI, report/block in 2 taps | ✅ Matches, messages, reports, blocks |
+| Safety | ✅ Report reasons, block dialog, Safety in nav | ✅ /api/reports, /api/blocks |
+| Material 3 light theme | ✅ AppTheme.light, DM Sans | — |
+| Animations | ✅ Splash, onboarding, list stagger, discovery scale | — |
+| Parallax / scroll | ✅ ParallaxSection widget, scroll-based reveal | — |
 
-## Scaling & concurrency (built-in)
+---
 
-The API is stateless per instance; scale **horizontally** on your host (e.g. multiple Render instances). Firestore handles data concurrency.
+## Setup & Running
 
-| Mechanism | Purpose |
-|-----------|---------|
-| **`helmet`** | Sensible security headers |
-| **Global rate limit** | Per-IP cap (15 min window); `/health` is excluded |
-| **Discovery rate limit** | Per authenticated user / minute (heavy Firestore reads) |
-| **KYC rate limit** | Per user / hour + **semaphore** limiting parallel face-detection jobs per instance |
-| **Discovery prep cache** | Short TTL LRU for exclusion + incoming-like queries; **busted** on pass / like / block |
-| **Firestore `.select()`** | Smaller reads for discovery candidates and swipe exclusion queries |
-| **`getAll` batching** | Matches list + rooms list fetch owner profiles in chunks, not N sequential reads |
-| **`TRUST_PROXY=1`** | Use real client IP behind Render/nginx (required for accurate rate limits) |
+See `app/README.md` and `backend/README.md` for specific instructions.
 
-### Render: fix KYC / “wrong Firebase project”
-
-Set **`FIREBASE_SERVICE_ACCOUNT_JSON`** to the full service account JSON from Firebase project **`dapp-79473`** (same as the app’s `google-services.json`). See **`RENDER_DEPLOY.md`** in this folder.
-
-## API (Bearer: Firebase ID token)
-
-- `GET /health` — Health check
-- `GET/PUT /api/users/me` — Current user profile
-- `GET /api/discovery` — Discovery feed
-- `POST /api/likes`, `POST /api/passes` — Swipe actions
-- `GET /api/matches` — Matches
-- `POST /api/matches/:matchId/unmatch` — Remove chat for both + block
-- `GET/POST /api/chats/:matchId/messages` — Chat
-- `POST /api/reports`, `POST /api/blocks` — Safety (block also removes an existing 1:1 match chat)
-- KYC and rooms routes as implemented in `src/index.js`
-
-## Firestore indexes (Meetup)
-
-The Meetup (rooms) discovery query uses a composite index on `status` + `eventAt`. If you see **"The query requires an index"** in the app:
-
-1. From the **project root** (where `firebase.json` and `firestore.indexes.json` live), run:
-   ```bash
-   firebase deploy --only firestore:indexes
-   ```
-   (Requires [Firebase CLI](https://firebase.google.com/docs/cli) and `firebase use dapp-79473` or your project.)
-
-2. Or click the link in the error message in the app to create the index in Firebase Console. Wait until the index status is **Ready**, then tap **Retry** in the Meetup screen.
-
-## Scripts
-
-- `npm start` — Production
-- `npm run dev` — Dev with `--watch`
+---
 
 ## License
 
-Private / your project terms.
+Private / educational use.

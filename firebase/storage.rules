@@ -1,0 +1,30 @@
+rules_version = '2';
+// Craft rules based on data in your Firestore database
+// allow write: if firestore.get(
+//    /databases/(default)/documents/users/$(request.auth.uid)).data.isAdmin;
+service firebase.storage {
+  match /b/{bucket}/o {
+    // User profile photos: only owner; image type; size limit; user doc must exist in Firestore
+    match /users/{userId}/photos/{photoId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.size < 500 * 1024
+        && request.resource.contentType.matches('image/.*')
+        && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data != null;
+    }
+    // KYC selfie: camera-only upload; same user + Firestore user doc
+    match /users/{userId}/kyc/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.size < 500 * 1024
+        && request.resource.contentType.matches('image/.*')
+        && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data != null;
+    }
+    // Deny all other paths by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

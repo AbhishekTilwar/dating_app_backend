@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+.DS_Store
+# Firebase / GCP service account keys — never commit
+service-account.json
+service-account*.json
+*-firebase-adminsdk-*.json

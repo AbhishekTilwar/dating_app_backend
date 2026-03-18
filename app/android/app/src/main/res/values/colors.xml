@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Crossed brand colors for launch screen and theming -->
+<resources>
+    <color name="crossed_navy">#111C3B</color>
+    <color name="crossed_blue">#1D4B82</color>
+    <color name="crossed_coral">#EC675C</color>
+    <color name="crossed_launch_navy">#111C3B</color>
+    <color name="crossed_launch_blue">#1D4B82</color>
+	<color name="ic_launcher_background">#111C3B</color>
+</resources>
