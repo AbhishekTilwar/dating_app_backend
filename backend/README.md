@@ -1,6 +1,6 @@
 # Dating app backend (Spark API)
 
-Node.js + Express API for the Crossed dating app: Firebase Auth verification, Firestore, Storage, and KYC identity verification using free local gender detection (@vladmandic/human — no AWS).
+Node.js + Express API for the Crossed dating app: Firebase Auth verification, Firestore, Storage, and KYC identity verification using **@vladmandic/human** (local gender detection). On the server this pulls in **@tensorflow/tfjs-node** (declared in `package.json`) — without it, KYC fails with `Cannot find module '@tensorflow/tfjs-node'`.
 
 ## Prerequisites
 
@@ -29,6 +29,21 @@ npm run dev
 
 See `.env.example` for full list.
 
+## Scaling & concurrency (built-in)
+
+The API is stateless per instance; scale **horizontally** on your host (e.g. multiple Render instances). Firestore handles data concurrency.
+
+| Mechanism | Purpose |
+|-----------|---------|
+| **`helmet`** | Sensible security headers |
+| **Global rate limit** | Per-IP cap (15 min window); `/health` is excluded |
+| **Discovery rate limit** | Per authenticated user / minute (heavy Firestore reads) |
+| **KYC rate limit** | Per user / hour + **semaphore** limiting parallel face-detection jobs per instance |
+| **Discovery prep cache** | Short TTL LRU for exclusion + incoming-like queries; **busted** on pass / like / block |
+| **Firestore `.select()`** | Smaller reads for discovery candidates and swipe exclusion queries |
+| **`getAll` batching** | Matches list + rooms list fetch owner profiles in chunks, not N sequential reads |
+| **`TRUST_PROXY=1`** | Use real client IP behind Render/nginx (required for accurate rate limits) |
+
 ### Render: fix KYC / “wrong Firebase project”
 
 Set **`FIREBASE_SERVICE_ACCOUNT_JSON`** to the full service account JSON from Firebase project **`dapp-79473`** (same as the app’s `google-services.json`). See **`RENDER_DEPLOY.md`** in this folder.
@@ -40,8 +55,9 @@ Set **`FIREBASE_SERVICE_ACCOUNT_JSON`** to the full service account JSON from Fi
 - `GET /api/discovery` — Discovery feed
 - `POST /api/likes`, `POST /api/passes` — Swipe actions
 - `GET /api/matches` — Matches
+- `POST /api/matches/:matchId/unmatch` — Remove chat for both + block
 - `GET/POST /api/chats/:matchId/messages` — Chat
-- `POST /api/reports`, `POST /api/blocks` — Safety
+- `POST /api/reports`, `POST /api/blocks` — Safety (block also removes an existing 1:1 match chat)
 - KYC and rooms routes as implemented in `src/index.js`
 
 ## Firestore indexes (Meetup)
