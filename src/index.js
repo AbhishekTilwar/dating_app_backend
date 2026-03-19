@@ -1,5 +1,7 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
@@ -87,8 +89,126 @@ function loadServiceAccountJson() {
 }
 
 const app = express();
+
+// Render / nginx / Cloud Load Balancer: use X-Forwarded-For for rate limits
+if (process.env.TRUST_PROXY === '1' || process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
+}
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  }),
+);
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '5mb' }));
+
+/** Global API throttle (per IP). Skips health checks. */
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_GLOBAL_MAX || 800),
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health',
+  message: { error: 'Too many requests. Try again shortly.' },
+});
+app.use(globalLimiter);
+
+/** Discovery: expensive Firestore reads — per user after auth. */
+const discoveryLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_DISCOVERY_MAX || 45),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) =>
+    req.uid ? req.uid : ipKeyGenerator(req.ip ?? '0.0.0.0'),
+  message: { error: 'Too many discovery refreshes. Wait a minute.' },
+});
+
+/** KYC uses CPU-heavy local inference — cap per user per hour. */
+const kycLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_KYC_MAX || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) =>
+    req.uid ? req.uid : ipKeyGenerator(req.ip ?? '0.0.0.0'),
+  message: { error: 'Too many verification attempts. Try again later.' },
+});
+
+/** Short TTL cache for discovery/nearby exclusion + incoming-like maps (cuts Firestore churn). */
+class TtlLruCache {
+  constructor(maxEntries, ttlMs) {
+    this.maxEntries = maxEntries;
+    this.ttlMs = ttlMs;
+    this.map = new Map();
+  }
+  get(key) {
+    const e = this.map.get(key);
+    if (!e) return undefined;
+    if (Date.now() > e.expiresAt) {
+      this.map.delete(key);
+      return undefined;
+    }
+    this.map.delete(key);
+    this.map.set(key, e);
+    return e.value;
+  }
+  set(key, value) {
+    if (this.map.has(key)) this.map.delete(key);
+    while (this.map.size >= this.maxEntries) {
+      const first = this.map.keys().next().value;
+      this.map.delete(first);
+    }
+    this.map.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+  delete(key) {
+    this.map.delete(key);
+  }
+}
+
+const discoveryCacheTtlMs = Number(process.env.DISCOVERY_CACHE_TTL_MS || 20000);
+const discoveryCacheMax = Number(process.env.DISCOVERY_CACHE_MAX_ENTRIES || 8000);
+const discoveryPrepCache = new TtlLruCache(discoveryCacheMax, discoveryCacheTtlMs);
+
+/** After pass/like/block, drop cached exclusion/incoming-like maps for affected users. */
+function bustDiscoveryPrepCacheForUsers(...uids) {
+  for (const uid of uids) {
+    if (!uid) continue;
+    discoveryPrepCache.delete(`excl:${uid}`);
+    discoveryPrepCache.delete(`inlike:${uid}`);
+  }
+}
+
+/** Limit parallel Human.js face runs so one instance doesn’t melt under spikes. */
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.active = 0;
+    this.waiters = [];
+  }
+  acquire() {
+    return new Promise((resolve) => {
+      const tryTake = () => {
+        if (this.active < this.max) {
+          this.active++;
+          resolve();
+        } else {
+          this.waiters.push(tryTake);
+        }
+      };
+      tryTake();
+    });
+  }
+  release() {
+    this.active = Math.max(0, this.active - 1);
+    const w = this.waiters.shift();
+    if (w) w();
+  }
+}
+
+const kycMaxConcurrent = Math.max(1, Number(process.env.KYC_MAX_CONCURRENT || 2));
+const kycSemaphore = new Semaphore(kycMaxConcurrent);
 
 const kycSelfieUpload = multer({
   storage: multer.memoryStorage(),
@@ -145,6 +265,118 @@ if (!getApps().length) {
 const db = getFirestore();
 const auth = getAuth();
 
+/** User fields returned to the Flutter app (matches UserProfile.fromDoc usage). */
+const DISCOVERY_USER_FIELDS = [
+  'displayName',
+  'showFullName',
+  'bio',
+  'photos',
+  'prompts',
+  'relationshipGoal',
+  'openingMove',
+  'gender',
+  'dateOfBirth',
+  'age',
+  'zodiacSign',
+  'isPremium',
+  'profileComplete',
+  'onboardingDone',
+  'kycVerified',
+  'kycSkipped',
+  'updatedAt',
+  'locationVisible',
+  'latitude',
+  'longitude',
+];
+
+const INTERESTED_IN_ALLOWED = ['Male', 'Female', 'Transgender'];
+
+function sanitizeInterestedIn(raw) {
+  if (!Array.isArray(raw)) return [];
+  return [
+    ...new Set(
+      raw
+        .map((g) => String(g || '').trim())
+        .filter((g) => INTERESTED_IN_ALLOWED.includes(g)),
+    ),
+  ];
+}
+
+/** Name shown in discovery: full name only when opted in; else first letter + "." */
+function discoveryPublicDisplayName(data) {
+  const raw = String(data.displayName || '').trim();
+  if (!raw) return 'Someone';
+  if (data.showFullName === true) return raw;
+  try {
+    const m = raw.match(/\p{L}/u);
+    const ch = m ? m[0] : raw.charAt(0);
+    if (!ch) return '?';
+    return ch.toUpperCase() + '.';
+  } catch {
+    const ch = raw.charAt(0);
+    if (!ch) return '?';
+    return ch.toUpperCase() + '.';
+  }
+}
+
+function firestoreDateToIso(v) {
+  if (!v) return null;
+  if (typeof v === 'string') return v;
+  if (v && typeof v.toDate === 'function') {
+    try {
+      return v.toDate().toISOString();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Host snippet on meetup list/detail (same display name rules as discovery). */
+function meetupOwnerPublicProfile(ownerId, userData) {
+  if (!ownerId || !userData) return null;
+  const photos = Array.isArray(userData.photos)
+    ? userData.photos.filter((p) => typeof p === 'string' && p.length > 0)
+    : [];
+  const rawPrompts = Array.isArray(userData.prompts) ? userData.prompts : [];
+  const prompts = rawPrompts
+    .filter((p) => p && typeof p === 'object')
+    .map((p) => ({
+      question: String(p.question || '').trim(),
+      answer: String(p.answer || '').trim(),
+    }))
+    .filter((p) => p.question && p.answer);
+  return {
+    id: ownerId,
+    displayName: discoveryPublicDisplayName(userData),
+    bio: userData.bio != null ? String(userData.bio) : null,
+    photos,
+    prompts,
+    relationshipGoal: userData.relationshipGoal != null ? String(userData.relationshipGoal) : null,
+    openingMove: userData.openingMove != null ? String(userData.openingMove) : null,
+    gender: userData.gender != null ? String(userData.gender) : null,
+    age: userData.age != null && !Number.isNaN(Number(userData.age)) ? Number(userData.age) : null,
+    zodiacSign: userData.zodiacSign != null ? String(userData.zodiacSign) : null,
+    dateOfBirth: firestoreDateToIso(userData.dateOfBirth),
+  };
+}
+
+const GET_ALL_CHUNK = 30;
+
+async function fetchUserDocsByIds(ids) {
+  const unique = [...new Set(ids)].filter(Boolean);
+  const map = new Map();
+  for (let i = 0; i < unique.length; i += GET_ALL_CHUNK) {
+    const chunk = unique.slice(i, i + GET_ALL_CHUNK);
+    const refs = chunk.map((id) => db.collection('users').doc(id));
+    const snaps = await db.getAll(...refs);
+    for (const s of snaps) {
+      if (s.exists) map.set(s.id, s.data());
+    }
+  }
+  return map;
+}
+
 // Middleware: verify Firebase ID token from client
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -193,6 +425,11 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
       relationshipGoal,
       openingMove,
       gender,
+      interestedIn,
+      showFullName,
+      dateOfBirth,
+      age,
+      zodiacSign,
       isPremium,
       profileComplete,
       locationVisible,
@@ -209,6 +446,11 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
       ...(relationshipGoal != null && { relationshipGoal }),
       ...(openingMove != null && { openingMove }),
       ...(gender != null && { gender }),
+      ...(interestedIn != null && { interestedIn: sanitizeInterestedIn(interestedIn) }),
+      ...(typeof showFullName === 'boolean' && { showFullName }),
+      ...(dateOfBirth != null && { dateOfBirth }),
+      ...(age != null && { age: Number(age) }),
+      ...(zodiacSign != null && { zodiacSign: String(zodiacSign) }),
       ...(isPremium != null && { isPremium }),
       ...(profileComplete != null && { profileComplete: !!profileComplete }),
       ...(typeof locationVisible === 'boolean' && { locationVisible }),
@@ -224,12 +466,25 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
   }
 });
 
-/** Lazy-loaded Human for KYC gender detection (free, no API keys). Uses pure-JS JPEG decode, no native deps. */
+/**
+ * Lazy-loaded Human for KYC gender detection (free, no API keys).
+ * JPEG decode is pure JS (jpeg-js). On Node, @vladmandic/human resolves to human.node.js, which
+ * requires @tensorflow/tfjs-node — it must be listed in package.json (not optional).
+ */
 let _human = null;
 
 async function getHuman() {
   if (_human) return _human;
-  const Human = (await import('@vladmandic/human')).default;
+  const mod = await import('@vladmandic/human');
+  const Human =
+    mod.Human ??
+    mod.default?.Human ??
+    (typeof mod.default === 'function' ? mod.default : null);
+  if (typeof Human !== 'function') {
+    throw new Error(
+      'Human class not found on @vladmandic/human export (check package version / Node ESM interop)',
+    );
+  }
   _human = new Human({
     backend: 'cpu',
     modelBasePath: 'https://cdn.jsdelivr.net/npm/@vladmandic/human/models/',
@@ -273,59 +528,66 @@ async function runKycFromBuffer(uid, buffer, res) {
   if (process.env.KYC_DEV_APPROVE === '1') {
     verified = true;
   } else {
+    await kycSemaphore.acquire();
     try {
-      const human = await getHuman();
-      const tensor = await bufferToTensor(buffer);
-      const result = await human.detect(tensor);
-      tensor.dispose?.();
-      const face = result?.face?.[0];
-      if (!face) {
-        return res.status(400).json({
-          error: 'No face detected. Face the camera directly with good lighting.',
-        });
-      }
-      // Human: gender is 'male'|'female', genderScore 0..1
-      const detGender = String(face.gender || '').toLowerCase();
-      const conf = Math.round((face.genderScore ?? 0) * 100);
-      const isNonBinary = /non-binary|nonbinary/i.test(stated);
-      const preferSkip = /prefer not/i.test(stated);
+      try {
+        const human = await getHuman();
+        const tensor = await bufferToTensor(buffer);
+        const result = await human.detect(tensor);
+        tensor.dispose?.();
+        const face = result?.face?.[0];
+        if (!face) {
+          return res.status(400).json({
+            error: 'No face detected. Face the camera directly with good lighting.',
+          });
+        }
+        // Human: gender is 'male'|'female', genderScore 0..1
+        const detGender = String(face.gender || '').toLowerCase();
+        const conf = Math.round((face.genderScore ?? 0) * 100);
+        const isNonBinary = /non-binary|nonbinary/i.test(stated);
+        const preferSkip = /prefer not/i.test(stated);
 
-      if (isNonBinary || preferSkip) {
-        verified = conf >= 75 && !!detGender;
-      } else if (/^male$/i.test(stated)) {
-        verified = detGender === 'male' && conf >= 82;
-      } else if (/^female$/i.test(stated)) {
-        verified = detGender === 'female' && conf >= 82;
-      } else {
-        verified = !!detGender && conf >= 78;
-      }
+        if (isNonBinary || preferSkip) {
+          verified = conf >= 75 && !!detGender;
+        } else if (/^male$/i.test(stated)) {
+          verified = detGender === 'male' && conf >= 82;
+        } else if (/^female$/i.test(stated)) {
+          verified = detGender === 'female' && conf >= 82;
+        } else {
+          verified = !!detGender && conf >= 78;
+        }
 
-      if (!verified) {
-        return res.status(400).json({
-          error:
-            'We could not confirm your photo matches the gender you selected during onboarding. Please retake a clear selfie.',
+        if (!verified) {
+          return res.status(400).json({
+            error:
+              'We could not confirm your photo matches the gender you selected during onboarding. Please retake a clear selfie.',
+          });
+        }
+      } catch (impErr) {
+        if (
+          impErr?.code === 'MODULE_NOT_FOUND' ||
+          String(impErr?.message || '').includes('Cannot find module')
+        ) {
+          console.error('[kyc] module load:', impErr?.message || impErr);
+          return res.status(503).json({
+            error:
+              'Photo verification is temporarily unavailable. Please try again in a few minutes.',
+          });
+        }
+        const emsg = String(impErr?.message || '');
+        if (/invalid image|decode|jpeg|png|image format/i.test(emsg)) {
+          return res.status(400).json({
+            error:
+              'This photo could not be processed. Retake a clear, well-lit selfie (face the camera).',
+          });
+        }
+        console.error('[kyc] human detect error:', impErr?.message || impErr);
+        return res.status(500).json({
+          error: 'Verification failed. Please retake a clear selfie and try again.',
         });
       }
-    } catch (impErr) {
-      if (
-        impErr?.code === 'MODULE_NOT_FOUND' ||
-        String(impErr?.message || '').includes('Cannot find module')
-      ) {
-        return res.status(503).json({
-          error: 'KYC unavailable. Run npm install in backend, or set KYC_DEV_APPROVE=1 for local dev.',
-        });
-      }
-      const emsg = String(impErr?.message || '');
-      if (/invalid image|decode|jpeg|png|image format/i.test(emsg)) {
-        return res.status(400).json({
-          error:
-            'This photo could not be processed. Retake a clear, well-lit selfie (face the camera).',
-        });
-      }
-      console.error('[kyc] human detect error:', impErr?.message || impErr);
-      return res.status(500).json({
-        error: 'Verification failed. Please retake a clear selfie and try again.',
-      });
+    } finally {
+      kycSemaphore.release();
     }
   }
 
@@ -341,7 +603,7 @@ async function runKycFromBuffer(uid, buffer, res) {
 }
 
 // KYC: 1) raw JPEG body (octet-stream / image/jpeg) — most reliable on Render. 2) multipart selfie. 3) JSON base64. 4) Storage legacy.
-app.post('/api/kyc/verify', requireAuth, async (req, res) => {
+app.post('/api/kyc/verify', requireAuth, kycLimiter, async (req, res) => {
   try {
     const uid = req.uid;
     const ct = (req.headers['content-type'] || '').toLowerCase();
@@ -432,6 +694,21 @@ app.post('/api/kyc/verify', requireAuth, async (req, res) => {
   }
 });
 
+/** Sort key for match docs: Firestore orderBy(updatedAt) omits docs missing that field — sort in app instead. */
+function matchRecencyMs(data) {
+  if (!data) return 0;
+  const toMs = (v) => {
+    if (v == null) return 0;
+    if (typeof v === 'string') {
+      const ms = Date.parse(v);
+      return Number.isNaN(ms) ? 0 : ms;
+    }
+    if (typeof v.toMillis === 'function') return v.toMillis();
+    return 0;
+  };
+  return Math.max(toMs(data.updatedAt), toMs(data.createdAt));
+}
+
 // Haversine distance in km
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371;
@@ -445,13 +722,101 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
+/** User IDs to hide from discovery / nearby: self, passed, already liked, matched, blocked either way. */
+async function loadExclusionUserIds(uid) {
+  const cacheKey = `excl:${uid}`;
+  const cached = discoveryPrepCache.get(cacheKey);
+  if (cached) return new Set(cached);
+
+  const excluded = new Set([uid]);
+  const [
+    passSnap,
+    outLikeSnap,
+    matchSnap,
+    blockOutSnap,
+    blockInSnap,
+  ] = await Promise.all([
+    db.collection('passes').where('fromId', '==', uid).select('toId').limit(500).get(),
+    db.collection('likes').where('fromId', '==', uid).select('toId').limit(500).get(),
+    db.collection('matches').where('participants', 'array-contains', uid).select('participants').limit(200).get(),
+    db.collection('blocks').where('fromId', '==', uid).select('toId').limit(200).get(),
+    db.collection('blocks').where('toId', '==', uid).select('fromId').limit(200).get(),
+  ]);
+  for (const d of passSnap.docs) {
+    const t = d.data().toId;
+    if (t) excluded.add(t);
+  }
+  for (const d of outLikeSnap.docs) {
+    const t = d.data().toId;
+    if (t) excluded.add(t);
+  }
+  for (const d of matchSnap.docs) {
+    for (const p of d.data().participants || []) {
+      if (p && p !== uid) excluded.add(p);
+    }
+  }
+  for (const d of blockOutSnap.docs) {
+    const t = d.data().toId;
+    if (t) excluded.add(t);
+  }
+  for (const d of blockInSnap.docs) {
+    const f = d.data().fromId;
+    if (f) excluded.add(f);
+  }
+  discoveryPrepCache.set(cacheKey, [...excluded]);
+  return excluded;
+}
+
+/** Map fromId -> superLike (people who liked the current user first). */
+async function loadIncomingLikesMap(uid) {
+  const cacheKey = `inlike:${uid}`;
+  const cached = discoveryPrepCache.get(cacheKey);
+  if (cached) return new Map(cached);
+
+  const snap = await db
+    .collection('likes')
+    .where('toId', '==', uid)
+    .select('fromId', 'superLike')
+    .limit(400)
+    .get();
+  const map = new Map();
+  for (const d of snap.docs) {
+    const data = d.data();
+    const from = data.fromId;
+    if (from) map.set(from, !!data.superLike);
+  }
+  discoveryPrepCache.set(cacheKey, [...map.entries()]);
+  return map;
+}
+
+function deterministicJitter(uid, candidateId, dayKey) {
+  const mix = `${uid}|${candidateId}|${dayKey}`;
+  let h = 0;
+  for (let i = 0; i < mix.length; i++) {
+    h = ((h << 5) - h + mix.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h) % 1000 / 10000;
+}
+
+async function isBlockedPair(uid, targetId) {
+  const [a, b] = await Promise.all([
+    db.collection('blocks').doc(`${uid}_${targetId}`).get(),
+    db.collection('blocks').doc(`${targetId}_${uid}`).get(),
+  ]);
+  return a.exists || b.exists;
+}
+
 // --- Nearby (map) — users who have location visible, sorted by distance ---
+// Optional query: gender = 'Male' | 'Female' | 'Transgender' | … (same as discovery) to filter by profile gender.
 app.get('/api/nearby', requireAuth, async (req, res) => {
   try {
     const lat = parseFloat(req.query.lat);
     const lng = parseFloat(req.query.lng);
     const radiusKm = Math.min(parseFloat(req.query.radiusKm || '100') || 100, 500);
     const limit = Math.min(parseInt(req.query.limit || '50', 10), 100);
+    const genderFilter = (req.query.gender || '').toString().trim();
+    const allowedGenders = ['Male', 'Female', 'Transgender', 'Non-binary', 'Prefer not to say'];
+    const gender = allowedGenders.includes(genderFilter) ? genderFilter : null;
     if (Number.isNaN(lat) || Number.isNaN(lng)) {
       return res.status(400).json({ error: 'lat and lng query params required' });
     }
@@ -461,15 +826,22 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
       .limit(500)
       .get();
     const meId = req.uid;
+    let excluded;
+    try {
+      excluded = await loadExclusionUserIds(meId);
+    } catch (e) {
+      excluded = new Set([meId]);
+    }
     const withDistance = [];
     for (const d of snapshot.docs) {
-      if (d.id === meId) continue;
+      if (d.id === meId || excluded.has(d.id)) continue;
       const data = d.data();
       const userLat = data.latitude;
       const userLng = data.longitude;
       if (userLat == null || userLng == null) continue;
       const km = haversineKm(lat, lng, userLat, userLng);
       if (km > radiusKm) continue;
+      if (gender && data.gender !== gender) continue;
       withDistance.push({ id: d.id, ...data, distanceKm: km });
     }
     withDistance.sort((a, b) => a.distanceKm - b.distanceKm);
@@ -482,8 +854,10 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
 
 // --- Discovery (suggestions) ---
 // Optional query: gender = 'Male' | 'Female' | 'Transgender' to filter by profile gender.
+// Ranks by: incoming like/super-like, relationship goal match, distance, KYC, daily shuffle jitter.
+// Excludes: self, passed, outgoing likes, matches, blocks.
 // Discovery is allowed for all authenticated users; likes require identity verification.
-app.get('/api/discovery', requireAuth, async (req, res) => {
+app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
   try {
     const uid = req.uid;
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 50);
@@ -491,16 +865,76 @@ app.get('/api/discovery', requireAuth, async (req, res) => {
     const allowedGenders = ['Male', 'Female', 'Transgender', 'Non-binary', 'Prefer not to say'];
     const gender = allowedGenders.includes(genderFilter) ? genderFilter : null;
 
-    let query = db.collection('users').where('profileComplete', '==', true);
-    if (gender) {
-      query = query.where('gender', '==', gender);
-    }
-    const snapshot = await query.limit(Math.min(limit + 15, 60)).get();
+    const [meSnap, excluded, incomingLikes] = await Promise.all([
+      db.collection('users').doc(uid).get(),
+      loadExclusionUserIds(uid),
+      loadIncomingLikesMap(uid),
+    ]);
+    const me = meSnap.data() || {};
+    const myGoal = String(me.relationshipGoal || '').trim().toLowerCase();
+    const myLat = me.latitude;
+    const myLng = me.longitude;
 
-    const list = snapshot.docs
-      .filter((d) => d.id !== uid)
-      .slice(0, limit)
-      .map((d) => ({ id: d.id, ...d.data() }));
+    const interestedRaw = Array.isArray(me.interestedIn) ? me.interestedIn : [];
+    const interested = sanitizeInterestedIn(interestedRaw);
+
+    let query = db.collection('users').where('profileComplete', '==', true);
+    const clientGender = gender;
+    if (clientGender) {
+      query = query.where('gender', '==', clientGender);
+    } else if (interested.length === 1) {
+      query = query.where('gender', '==', interested[0]);
+    } else if (interested.length > 1) {
+      query = query.where('gender', 'in', interested.slice(0, 10));
+    }
+    query = query.select(...DISCOVERY_USER_FIELDS);
+    const fetchCap = Math.min(Math.max(limit * 12, 100), 400);
+    const snapshot = await query.limit(fetchCap).get();
+
+    const dayKey = new Date().toISOString().slice(0, 10);
+    const scored = [];
+    for (const d of snapshot.docs) {
+      const id = d.id;
+      if (excluded.has(id)) continue;
+      const data = d.data();
+      const theirGender = String(data.gender || '');
+      if (interested.length > 0 && !interested.includes(theirGender)) {
+        continue;
+      }
+      if (clientGender && theirGender !== clientGender) {
+        continue;
+      }
+      let score = 0;
+      if (incomingLikes.has(id)) {
+        score += 100;
+        if (incomingLikes.get(id)) score += 28;
+      }
+      const theirGoal = String(data.relationshipGoal || '').trim().toLowerCase();
+      if (myGoal && theirGoal && myGoal === theirGoal) score += 22;
+      if (data.kycVerified === true) score += 10;
+      const ulat = data.latitude;
+      const ulng = data.longitude;
+      if (
+        myLat != null &&
+        myLng != null &&
+        ulat != null &&
+        ulng != null &&
+        !Number.isNaN(Number(myLat)) &&
+        !Number.isNaN(Number(myLng))
+      ) {
+        const km = haversineKm(Number(myLat), Number(myLng), Number(ulat), Number(ulng));
+        score += Math.max(0, 35 - km / 2.5);
+      }
+      score += deterministicJitter(uid, id, dayKey);
+      scored.push({ id, data, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const list = scored.slice(0, limit).map(({ id, data }) => {
+      const displayName = discoveryPublicDisplayName(data);
+      const { showFullName: _sf, ...rest } = data;
+      return { id, ...rest, displayName };
+    });
     res.json({ suggestions: list });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -518,12 +952,19 @@ app.post('/api/likes', requireAuth, async (req, res) => {
     }
     const { targetId, superLike } = req.body;
     if (!targetId) return res.status(400).json({ error: 'targetId required' });
+    if (targetId === uid) {
+      return res.status(400).json({ error: 'Invalid target' });
+    }
+    if (await isBlockedPair(uid, targetId)) {
+      return res.status(403).json({ error: 'You cannot interact with this profile.' });
+    }
     await db.collection('likes').doc(`${uid}_${targetId}`).set({
       fromId: uid,
       toId: targetId,
       superLike: !!superLike,
       createdAt: new Date().toISOString(),
     });
+    bustDiscoveryPrepCacheForUsers(uid, targetId);
 
     // Check for mutual like: target has already liked uid
     const reverseLike = await db.collection('likes').doc(`${targetId}_${uid}`).get();
@@ -553,14 +994,95 @@ app.post('/api/likes', requireAuth, async (req, res) => {
 
 app.post('/api/passes', requireAuth, async (req, res) => {
   try {
+    const uid = req.uid;
     const { targetId } = req.body;
     if (!targetId) return res.status(400).json({ error: 'targetId required' });
-    await db.collection('passes').doc(`${req.uid}_${targetId}`).set({
-      fromId: req.uid,
+    if (targetId === uid) {
+      return res.status(400).json({ error: 'Invalid target' });
+    }
+    if (await isBlockedPair(uid, targetId)) {
+      return res.status(403).json({ error: 'You cannot interact with this profile.' });
+    }
+    await db.collection('passes').doc(`${uid}_${targetId}`).set({
+      fromId: uid,
       toId: targetId,
       createdAt: new Date().toISOString(),
     });
+    bustDiscoveryPrepCacheForUsers(uid, targetId);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** Undo last pass: remove your pass doc so they can appear in discovery again. */
+app.delete('/api/passes/:targetId', requireAuth, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const targetId = (req.params.targetId || '').trim();
+    if (!targetId) return res.status(400).json({ error: 'targetId required' });
+    if (targetId === uid) {
+      return res.status(400).json({ error: 'Invalid target' });
+    }
+    const ref = db.collection('passes').doc(`${uid}_${targetId}`);
+    const doc = await ref.get();
+    if (!doc.exists) {
+      return res.status(404).json({ error: 'Pass not found' });
+    }
+    await ref.delete();
+    bustDiscoveryPrepCacheForUsers(uid, targetId);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** People who liked the current user (not yet matched, not blocked). */
+app.get('/api/likes/incoming', requireAuth, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const [likesSnap, matchSnap, blockOutSnap, blockInSnap] = await Promise.all([
+      db.collection('likes').where('toId', '==', uid).limit(200).get(),
+      db.collection('matches').where('participants', 'array-contains', uid).limit(200).get(),
+      db.collection('blocks').where('fromId', '==', uid).limit(200).get(),
+      db.collection('blocks').where('toId', '==', uid).limit(200).get(),
+    ]);
+    const matchedIds = new Set();
+    for (const d of matchSnap.docs) {
+      for (const p of d.data().participants || []) {
+        if (p && p !== uid) matchedIds.add(p);
+      }
+    }
+    const blocked = new Set();
+    for (const d of blockOutSnap.docs) {
+      const t = d.data().toId;
+      if (t) blocked.add(t);
+    }
+    for (const d of blockInSnap.docs) {
+      const f = d.data().fromId;
+      if (f) blocked.add(f);
+    }
+    const seen = new Set();
+    const list = [];
+    for (const d of likesSnap.docs) {
+      const data = d.data();
+      const fromId = data.fromId;
+      if (!fromId || fromId === uid) continue;
+      if (matchedIds.has(fromId) || blocked.has(fromId)) continue;
+      if (seen.has(fromId)) continue;
+      seen.add(fromId);
+      const userDoc = await db.collection('users').doc(fromId).get();
+      if (!userDoc.exists) continue;
+      const u = userDoc.data();
+      list.push({
+        fromId,
+        superLike: !!data.superLike,
+        createdAt: data.createdAt || null,
+        displayName: u.displayName || 'Someone',
+        photos: Array.isArray(u.photos) ? u.photos : [],
+      });
+    }
+    res.json({ incoming: list });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -574,30 +1096,58 @@ app.get('/api/matches', requireAuth, async (req, res) => {
     const snapshot = await db
       .collection('matches')
       .where('participants', 'array-contains', uid)
-      .orderBy('updatedAt', 'desc')
       .limit(100)
       .get();
-    const list = await Promise.all(
-      snapshot.docs.map(async (d) => {
-        const data = d.data();
-        const participants = data.participants || [];
-        const otherId = participants.find((p) => p !== uid);
-        let otherUser = { id: otherId };
-        if (otherId) {
-          const userDoc = await db.collection('users').doc(otherId).get();
-          if (userDoc.exists) {
-            const u = userDoc.data();
-            otherUser = {
-              id: otherId,
-              displayName: u.displayName || 'Someone',
-              photos: u.photos || [],
-            };
-          }
-        }
-        return { id: d.id, ...data, otherUser };
+    const otherIds = snapshot.docs
+      .map((d) => {
+        const participants = d.data().participants || [];
+        return participants.find((p) => p !== uid);
       })
-    );
+      .filter(Boolean);
+    const userMap = await fetchUserDocsByIds(otherIds);
+    const list = snapshot.docs.map((d) => {
+      const data = d.data();
+      const participants = data.participants || [];
+      const otherId = participants.find((p) => p !== uid);
+      let otherUser = { id: otherId };
+      if (otherId) {
+        const u = userMap.get(otherId);
+        if (u) {
+          otherUser = {
+            id: otherId,
+            displayName: u.displayName || 'Someone',
+            photos: u.photos || [],
+          };
+        }
+      }
+      return { id: d.id, ...data, otherUser };
+    });
+    list.sort((a, b) => matchRecencyMs(b) - matchRecencyMs(a));
     res.json({ matches: list });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Unmatch: delete match + messages for both; block pair (same effect as block for likes/discovery).
+app.post('/api/matches/:matchId/unmatch', requireAuth, async (req, res) => {
+  try {
+    const result = await getMatchAndRequireParticipant(req, res);
+    if (!result) return;
+    const { matchId, matchDoc } = result;
+    const participants = matchDoc.data().participants || [];
+    const otherId = participants.find((p) => p !== req.uid);
+    if (!otherId) {
+      return res.status(400).json({ error: 'Invalid match' });
+    }
+    await db.collection('blocks').doc(`${req.uid}_${otherId}`).set({
+      fromId: req.uid,
+      toId: otherId,
+      createdAt: new Date().toISOString(),
+    });
+    bustDiscoveryPrepCacheForUsers(req.uid, otherId);
+    await deleteMatchAndMessages(matchId);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -617,6 +1167,46 @@ async function getMatchAndRequireParticipant(req, res) {
     return null;
   }
   return { matchId, matchDoc };
+}
+
+/** Remove all message docs under a match, then the match doc (chat gone for both users). */
+async function deleteMatchAndMessages(matchId) {
+  const matchRef = db.collection('matches').doc(matchId);
+  const messagesCol = matchRef.collection('messages');
+  const pageSize = 400;
+  for (;;) {
+    const snap = await messagesCol.limit(pageSize).get();
+    if (snap.empty) break;
+    const batch = db.batch();
+    for (const d of snap.docs) {
+      batch.delete(d.ref);
+    }
+    await batch.commit();
+  }
+  await matchRef.delete();
+}
+
+/** Max raw bytes for in-chat ephemeral payloads (Firestore only — no object storage). */
+const EPHEMERAL_IMAGE_MAX_BYTES = 380000;
+const EPHEMERAL_VOICE_MAX_BYTES = 260000;
+
+async function recomputeMatchLastMessage(matchId) {
+  const snap = await db
+    .collection('matches')
+    .doc(matchId)
+    .collection('messages')
+    .orderBy('createdAt', 'desc')
+    .limit(1)
+    .get();
+  let lastMessage = '';
+  if (!snap.empty) {
+    lastMessage = String(snap.docs[0].data().text || '').slice(0, 100);
+  }
+  const now = new Date().toISOString();
+  await db.collection('matches').doc(matchId).update({
+    lastMessage,
+    updatedAt: now,
+  });
 }
 
 app.get('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
@@ -643,7 +1233,62 @@ app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
     const result = await getMatchAndRequireParticipant(req, res);
     if (!result) return;
     const { matchId } = result;
-    const { text } = req.body;
+    const { text, ephemeral } = req.body;
+
+    if (ephemeral && typeof ephemeral === 'object') {
+      const kind =
+        ephemeral.kind === 'voice' ? 'voice' : ephemeral.kind === 'image' ? 'image' : null;
+      const mimeType = typeof ephemeral.mimeType === 'string' ? ephemeral.mimeType.trim() : '';
+      const data = typeof ephemeral.data === 'string' ? ephemeral.data.trim() : '';
+      if (!kind || !mimeType || !data) {
+        return res.status(400).json({ error: 'ephemeral requires kind, mimeType, data' });
+      }
+      let buf;
+      try {
+        buf = Buffer.from(data, 'base64');
+      } catch {
+        return res.status(400).json({ error: 'invalid base64' });
+      }
+      const max = kind === 'voice' ? EPHEMERAL_VOICE_MAX_BYTES : EPHEMERAL_IMAGE_MAX_BYTES;
+      if (buf.length > max) {
+        return res.status(400).json({ error: `ephemeral ${kind} too large (max ${max} bytes)` });
+      }
+      if (kind === 'image') {
+        if (!/^image\/(jpeg|jpg|png|webp)$/i.test(mimeType)) {
+          return res.status(400).json({ error: 'unsupported image mime' });
+        }
+      } else if (!/^audio\/(mpeg|mp3|mp4|aac|webm|x-m4a|m4a)$/i.test(mimeType)) {
+        return res.status(400).json({ error: 'unsupported audio mime' });
+      }
+
+      const ref = db.collection('matches').doc(matchId).collection('messages').doc();
+      const now = new Date().toISOString();
+      const placeholder = kind === 'image' ? '📷 Disappearing photo' : '🎤 Disappearing voice';
+      await ref.set({
+        senderId: req.uid,
+        text: placeholder,
+        createdAt: now,
+        ephemeral: true,
+        ephemeralKind: kind,
+        mimeType,
+        ephemeralPayload: data,
+      });
+      await db.collection('matches').doc(matchId).update({
+        updatedAt: now,
+        lastMessage: placeholder,
+      });
+      return res.json({
+        id: ref.id,
+        senderId: req.uid,
+        text: placeholder,
+        createdAt: now,
+        ephemeral: true,
+        ephemeralKind: kind,
+        mimeType,
+        ephemeralPayload: data,
+      });
+    }
+
     if (!text?.trim()) return res.status(400).json({ error: 'text required' });
     const ref = db.collection('matches').doc(matchId).collection('messages').doc();
     const now = new Date().toISOString();
@@ -657,6 +1302,27 @@ app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
       lastMessage: text.trim().slice(0, 100),
     });
     res.json({ id: ref.id, senderId: req.uid, text: text.trim(), createdAt: now });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/chats/:matchId/messages/:messageId', requireAuth, async (req, res) => {
+  try {
+    const result = await getMatchAndRequireParticipant(req, res);
+    if (!result) return;
+    const { matchId } = result;
+    const { messageId } = req.params;
+    const ref = db.collection('matches').doc(matchId).collection('messages').doc(messageId);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: 'Message not found' });
+    const d = doc.data();
+    if (!d.ephemeral) {
+      return res.status(403).json({ error: 'Only disappearing messages can be deleted this way' });
+    }
+    await ref.delete();
+    await recomputeMatchLastMessage(matchId);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -690,43 +1356,90 @@ app.get('/api/rooms', requireAuth, async (req, res) => {
       const sorted = snapshot.docs.sort(
         (a, b) => (b.data().createdAt || '').localeCompare(a.data().createdAt || '')
       );
-      const rooms = await Promise.all(
-        sorted.map(async (doc) => {
-          const d = doc.data();
-          const ownerDoc = await db.collection('users').doc(d.ownerId).get();
-          const ownerName = ownerDoc.exists ? (ownerDoc.data().displayName || 'Host') : 'Host';
-          return {
-            id: doc.id,
-            ...d,
-            ownerName,
-            currentParticipants: (d.participants || []).length,
-          };
-        })
-      );
-      return res.json({ rooms });
-    }
-
-    // Discovery: open rooms (exclude current user's own for cleaner feed, or include — including is fine)
-    const snapshot = await db
-      .collection('rooms')
-      .where('status', '==', 'open')
-      .orderBy('eventAt', 'asc')
-      .limit(limit)
-      .get();
-    const rooms = await Promise.all(
-      snapshot.docs.map(async (doc) => {
+      const mineOwnerIds = [...new Set(sorted.map((doc) => doc.data().ownerId).filter(Boolean))];
+      const mineOwners = await fetchUserDocsByIds(mineOwnerIds);
+      const rooms = sorted.map((doc) => {
         const d = doc.data();
-        const ownerDoc = await db.collection('users').doc(d.ownerId).get();
-        const ownerName = ownerDoc.exists ? (ownerDoc.data().displayName || 'Host') : 'Host';
+        const u = d.ownerId ? mineOwners.get(d.ownerId) : null;
+        const ownerName = u ? (u.displayName || 'Host') : 'Host';
         return {
           id: doc.id,
           ...d,
           ownerName,
+          ownerProfile: meetupOwnerPublicProfile(d.ownerId, u),
           currentParticipants: (d.participants || []).length,
         };
-      })
-    );
-    res.json({ rooms });
+      });
+      return res.json({ rooms });
+    }
+
+    // Discovery: active (upcoming, not ended) or past (grey tab) — full rooms stay visible until host closes or time passes
+    const pastDiscovery = req.query.past === '1' || req.query.past === 'true';
+    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+
+    const enrichRoomDocs = async (docs) => {
+      const ownerIds = [...new Set(docs.map((doc) => doc.data().ownerId).filter(Boolean))];
+      const owners = await fetchUserDocsByIds(ownerIds);
+      return docs.map((doc) => {
+        const d = doc.data();
+        const u = d.ownerId ? owners.get(d.ownerId) : null;
+        const ownerName = u ? (u.displayName || 'Host') : 'Host';
+        return {
+          id: doc.id,
+          ...d,
+          ownerName,
+          ownerProfile: meetupOwnerPublicProfile(d.ownerId, u),
+          currentParticipants: (d.participants || []).length,
+        };
+      });
+    };
+
+    if (!pastDiscovery) {
+      const fetchLim = Math.min(limit * 3, 120);
+      const [snapOpen, snapFull] = await Promise.all([
+        db.collection('rooms').where('status', '==', 'open').orderBy('eventAt', 'asc').limit(fetchLim).get(),
+        db.collection('rooms').where('status', '==', 'full').orderBy('eventAt', 'asc').limit(fetchLim).get(),
+      ]);
+      const byId = new Map();
+      for (const doc of snapOpen.docs) byId.set(doc.id, doc);
+      for (const doc of snapFull.docs) byId.set(doc.id, doc);
+      const activeDocs = [...byId.values()].filter((doc) => {
+        const d = doc.data();
+        const st = d.status || 'open';
+        if (st === 'ended' || st === 'cancelled') return false;
+        const t = new Date(d.eventAt || 0).getTime();
+        return t >= nowMs;
+      });
+      activeDocs.sort((a, b) => {
+        const ta = new Date(a.data().eventAt || 0).getTime();
+        const tb = new Date(b.data().eventAt || 0).getTime();
+        return ta - tb;
+      });
+      const slice = activeDocs.slice(0, limit);
+      const rooms = await enrichRoomDocs(slice);
+      return res.json({ rooms });
+    }
+
+    const [snapEnded, snapCancelled, snapOpenPast, snapFullPast] = await Promise.all([
+      db.collection('rooms').where('status', '==', 'ended').orderBy('eventAt', 'desc').limit(limit).get(),
+      db.collection('rooms').where('status', '==', 'cancelled').orderBy('eventAt', 'desc').limit(limit).get(),
+      db.collection('rooms').where('status', '==', 'open').where('eventAt', '<', nowIso).orderBy('eventAt', 'desc').limit(limit).get(),
+      db.collection('rooms').where('status', '==', 'full').where('eventAt', '<', nowIso).orderBy('eventAt', 'desc').limit(limit).get(),
+    ]);
+    const pastById = new Map();
+    for (const doc of snapEnded.docs) pastById.set(doc.id, doc);
+    for (const doc of snapCancelled.docs) pastById.set(doc.id, doc);
+    for (const doc of snapOpenPast.docs) pastById.set(doc.id, doc);
+    for (const doc of snapFullPast.docs) pastById.set(doc.id, doc);
+    const pastDocs = [...pastById.values()].sort((a, b) => {
+      const ta = new Date(b.data().eventAt || 0).getTime();
+      const tb = new Date(a.data().eventAt || 0).getTime();
+      return ta - tb;
+    });
+    const pastSlice = pastDocs.slice(0, limit);
+    const rooms = await enrichRoomDocs(pastSlice);
+    return res.json({ rooms });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -741,11 +1454,13 @@ app.get('/api/rooms/:roomId', requireAuth, async (req, res) => {
     if (!doc.exists) return res.status(404).json({ error: 'Room not found' });
     const d = doc.data();
     const ownerDoc = await db.collection('users').doc(d.ownerId).get();
-    const ownerName = ownerDoc.exists ? (ownerDoc.data().displayName || 'Host') : 'Host';
+    const od = ownerDoc.exists ? ownerDoc.data() : null;
+    const ownerName = od ? (od.displayName || 'Host') : 'Host';
     const payload = {
       id: doc.id,
       ...d,
       ownerName,
+      ownerProfile: meetupOwnerPublicProfile(d.ownerId, od),
       currentParticipants: (d.participants || []).length,
     };
     // For non-owners, include whether current user has requested and status
@@ -763,6 +1478,38 @@ app.get('/api/rooms/:roomId', requireAuth, async (req, res) => {
       }
     }
     res.json(payload);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Host closes meetup — only then (or once event time passes) it moves to "past"
+app.put('/api/rooms/:roomId/close', requireAuth, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const roomDoc = await db.collection('rooms').doc(roomId).get();
+    if (!roomDoc.exists) return res.status(404).json({ error: 'Room not found' });
+    const room = roomDoc.data();
+    if (room.ownerId !== req.uid) {
+      return res.status(403).json({ error: 'Only the host can close this meetup' });
+    }
+    const now = new Date().toISOString();
+    await db.collection('rooms').doc(roomId).update({
+      status: 'ended',
+      updatedAt: now,
+      closedAt: now,
+      closedByOwner: true,
+    });
+    const doc = await db.collection('rooms').doc(roomId).get();
+    const d = doc.data();
+    const ownerDoc = await db.collection('users').doc(d.ownerId).get();
+    const ownerName = ownerDoc.exists ? (ownerDoc.data().displayName || 'Host') : 'Host';
+    res.json({
+      id: doc.id,
+      ...d,
+      ownerName,
+      currentParticipants: (d.participants || []).length,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -832,6 +1579,13 @@ app.post('/api/rooms/:roomId/requests', requireAuth, async (req, res) => {
     const roomDoc = await db.collection('rooms').doc(roomId).get();
     if (!roomDoc.exists) return res.status(404).json({ error: 'Room not found' });
     const room = roomDoc.data();
+    if (room.status === 'ended' || room.status === 'cancelled') {
+      return res.status(400).json({ error: 'This meetup is closed' });
+    }
+    const eventMs = new Date(room.eventAt || 0).getTime();
+    if (eventMs < Date.now()) {
+      return res.status(400).json({ error: 'This meetup date has passed' });
+    }
     if (room.participants && room.participants.includes(uid)) {
       return res.status(400).json({ error: 'Already in this room' });
     }
@@ -907,6 +1661,15 @@ app.put('/api/rooms/:roomId/requests/:requestId', requireAuth, async (req, res) 
     if (reqData.roomId !== roomId || reqData.status !== 'pending') {
       return res.status(400).json({ error: 'Invalid request' });
     }
+    if (action === 'approve') {
+      if (room.status === 'ended' || room.status === 'cancelled') {
+        return res.status(400).json({ error: 'This meetup is closed' });
+      }
+      const eventMs = new Date(room.eventAt || 0).getTime();
+      if (eventMs < Date.now()) {
+        return res.status(400).json({ error: 'This meetup date has passed' });
+      }
+    }
     const now = new Date().toISOString();
     await db.collection('room_requests').doc(requestId).update({
       status: action,
@@ -917,10 +1680,11 @@ app.put('/api/rooms/:roomId/requests/:requestId', requireAuth, async (req, res) 
       const participants = room.participants || [room.ownerId];
       if (!participants.includes(requesterId)) {
         participants.push(requesterId);
+        // Stay "open" when full — meetups only leave the active feed when the host
+        // closes them or the event time has passed (see GET /api/rooms filters).
         await db.collection('rooms').doc(roomId).update({
           participants,
           updatedAt: now,
-          ...(participants.length >= (room.maxParticipants || 2) && { status: 'full' }),
         });
       }
       // Create or get match so they can chat in Matches; add room tag
@@ -979,11 +1743,21 @@ app.post('/api/blocks', requireAuth, async (req, res) => {
   try {
     const { targetId } = req.body;
     if (!targetId) return res.status(400).json({ error: 'targetId required' });
+    if (targetId === req.uid) {
+      return res.status(400).json({ error: 'Invalid target' });
+    }
     await db.collection('blocks').doc(`${req.uid}_${targetId}`).set({
       fromId: req.uid,
       toId: targetId,
       createdAt: new Date().toISOString(),
     });
+    bustDiscoveryPrepCacheForUsers(req.uid, targetId);
+    const sorted = [req.uid, targetId].sort();
+    const canonicalMatchId = `${sorted[0]}_${sorted[1]}`;
+    const matchSnap = await db.collection('matches').doc(canonicalMatchId).get();
+    if (matchSnap.exists) {
+      await deleteMatchAndMessages(canonicalMatchId);
+    }
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });

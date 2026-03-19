@@ -4,17 +4,23 @@
   "description": "Spark dating app API - Node.js + Firestore + Firebase Storage",
   "main": "src/index.js",
   "type": "module",
+  "engines": {
+    "node": ">=20 <23"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@tensorflow/tfjs-node": "^4.22.0",
     "@vladmandic/human": "^3.3.6",
     "cors": "^2.8.5",
-    "jpeg-js": "^0.4.4",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "express-rate-limit": "^8.3.1",
     "firebase-admin": "^12.7.0",
+    "helmet": "^8.1.0",
+    "jpeg-js": "^0.4.4",
     "multer": "^2.1.1"
   }
 }
