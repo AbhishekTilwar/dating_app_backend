@@ -101,7 +101,7 @@ app.use(
   }),
 );
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 /** Global API throttle (per IP). Skips health checks. */
 const globalLimiter = rateLimit({
@@ -1190,6 +1190,31 @@ async function deleteMatchAndMessages(matchId) {
 const EPHEMERAL_IMAGE_MAX_BYTES = 380000;
 const EPHEMERAL_VOICE_MAX_BYTES = 260000;
 
+/** Normalize client body for disappearing media (handles nested object, JSON string, or flat keys). */
+function normalizeEphemeralPayload(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  let e = body.ephemeral;
+  if (typeof e === 'string') {
+    try {
+      e = JSON.parse(e);
+    } catch {
+      return null;
+    }
+  }
+  if (e && typeof e === 'object' && !Array.isArray(e)) {
+    return e;
+  }
+  const k = body.ephemeralKind || body.kind;
+  if (k === 'voice' || k === 'image') {
+    const data = body.data ?? body.ephemeralData ?? body.payload;
+    const mimeType = body.mimeType ?? body.ephemeralMimeType;
+    if (typeof data === 'string' && typeof mimeType === 'string') {
+      return { kind: k, mimeType, data };
+    }
+  }
+  return null;
+}
+
 async function recomputeMatchLastMessage(matchId) {
   const snap = await db
     .collection('matches')
@@ -1233,13 +1258,16 @@ app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
     const result = await getMatchAndRequireParticipant(req, res);
     if (!result) return;
     const { matchId } = result;
-    const { text, ephemeral } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { text } = body;
+    const ephemeral = normalizeEphemeralPayload(body);
 
-    if (ephemeral && typeof ephemeral === 'object') {
+    if (ephemeral) {
       const kind =
         ephemeral.kind === 'voice' ? 'voice' : ephemeral.kind === 'image' ? 'image' : null;
       const mimeType = typeof ephemeral.mimeType === 'string' ? ephemeral.mimeType.trim() : '';
-      const data = typeof ephemeral.data === 'string' ? ephemeral.data.trim() : '';
+      const dataRaw = ephemeral.data;
+      const data = typeof dataRaw === 'string' ? dataRaw.replace(/\s/g, '') : '';
       if (!kind || !mimeType || !data) {
         return res.status(400).json({ error: 'ephemeral requires kind, mimeType, data' });
       }
@@ -1257,7 +1285,9 @@ app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
         if (!/^image\/(jpeg|jpg|png|webp)$/i.test(mimeType)) {
           return res.status(400).json({ error: 'unsupported image mime' });
         }
-      } else if (!/^audio\/(mpeg|mp3|mp4|aac|webm|x-m4a|m4a)$/i.test(mimeType)) {
+      } else if (
+        !/^audio\/(mpeg|mp3|mp4|aac|webm|x-m4a|m4a|3gpp|amr|ogg|opus|x-caf|caf)$/i.test(mimeType)
+      ) {
         return res.status(400).json({ error: 'unsupported audio mime' });
       }
 
