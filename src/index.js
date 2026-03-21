@@ -291,6 +291,17 @@ const DISCOVERY_USER_FIELDS = [
 
 const INTERESTED_IN_ALLOWED = ['Male', 'Female', 'Transgender'];
 
+/** Genders the Discover filter UI can request (comma `genders=` or legacy single `gender=`). */
+const DISCOVERY_CLIENT_GENDERS = ['Male', 'Female', 'Transgender'];
+
+const RELATIONSHIP_GOAL_FILTER_ALLOWED = [
+  'Long-term relationship',
+  'Short-term fun',
+  'New friends',
+  'Not sure yet',
+  'Life partner',
+];
+
 function sanitizeInterestedIn(raw) {
   if (!Array.isArray(raw)) return [];
   return [
@@ -300,6 +311,41 @@ function sanitizeInterestedIn(raw) {
         .filter((g) => INTERESTED_IN_ALLOWED.includes(g)),
     ),
   ];
+}
+
+/** @returns {string[]} unique Male/Female/Transgender from `genders=` or legacy `gender=`. Empty = not specified. */
+function parseDiscoveryClientGenders(req) {
+  const rawMulti = (req.query.genders || '').toString().trim();
+  const rawSingle = (req.query.gender || '').toString().trim();
+  let parts = [];
+  if (rawMulti) {
+    parts = rawMulti.split(',').map((s) => s.trim()).filter(Boolean);
+  } else if (rawSingle) {
+    parts = [rawSingle];
+  }
+  return [...new Set(parts.filter((g) => DISCOVERY_CLIENT_GENDERS.includes(g)))];
+}
+
+const PROFILE_GENDERS_ALLOWED = [
+  'Male',
+  'Female',
+  'Transgender',
+  'Non-binary',
+  'Prefer not to say',
+];
+
+/** @returns {string[]|null} null = no filter; else subset of PROFILE_GENDERS_ALLOWED */
+function parseNearbyGendersFilter(req) {
+  const rawMulti = (req.query.genders || '').toString().trim();
+  const rawSingle = (req.query.gender || '').toString().trim();
+  let parts = [];
+  if (rawMulti) {
+    parts = rawMulti.split(',').map((s) => s.trim()).filter(Boolean);
+  } else if (rawSingle) {
+    parts = [rawSingle];
+  }
+  const g = [...new Set(parts.filter((x) => PROFILE_GENDERS_ALLOWED.includes(x)))];
+  return g.length ? g : null;
 }
 
 /** Name shown in discovery: full name only when opted in; else first letter + "." */
@@ -807,16 +853,22 @@ async function isBlockedPair(uid, targetId) {
 }
 
 // --- Nearby (map) — users who have location visible, sorted by distance ---
-// Optional query: gender = 'Male' | 'Female' | 'Transgender' | … (same as discovery) to filter by profile gender.
+// Query: genders=Male,Female (or legacy gender=), radiusKm max 80, ageMin/ageMax, relationshipGoal, verifiedOnly.
 app.get('/api/nearby', requireAuth, async (req, res) => {
   try {
     const lat = parseFloat(req.query.lat);
     const lng = parseFloat(req.query.lng);
-    const radiusKm = Math.min(parseFloat(req.query.radiusKm || '100') || 100, 500);
+    const radiusRaw = parseFloat(req.query.radiusKm || '20');
+    const radiusKm = Math.min(Math.max(Number.isNaN(radiusRaw) ? 20 : radiusRaw, 1), 80);
     const limit = Math.min(parseInt(req.query.limit || '50', 10), 100);
-    const genderFilter = (req.query.gender || '').toString().trim();
-    const allowedGenders = ['Male', 'Female', 'Transgender', 'Non-binary', 'Prefer not to say'];
-    const gender = allowedGenders.includes(genderFilter) ? genderFilter : null;
+    const gendersFilter = parseNearbyGendersFilter(req);
+    const ageMinQ = parseInt(req.query.ageMin, 10);
+    const ageMaxQ = parseInt(req.query.ageMax, 10);
+    const hasAgeMin = !Number.isNaN(ageMinQ);
+    const hasAgeMax = !Number.isNaN(ageMaxQ);
+    const goalRaw = (req.query.relationshipGoal || '').toString().trim();
+    const relationshipGoalFilter = RELATIONSHIP_GOAL_FILTER_ALLOWED.includes(goalRaw) ? goalRaw : null;
+    const verifiedOnly = req.query.verifiedOnly === '1' || req.query.verifiedOnly === 'true';
     if (Number.isNaN(lat) || Number.isNaN(lng)) {
       return res.status(400).json({ error: 'lat and lng query params required' });
     }
@@ -841,7 +893,18 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
       if (userLat == null || userLng == null) continue;
       const km = haversineKm(lat, lng, userLat, userLng);
       if (km > radiusKm) continue;
-      if (gender && data.gender !== gender) continue;
+      const g = String(data.gender || '');
+      if (gendersFilter && !gendersFilter.includes(g)) continue;
+      if (hasAgeMin || hasAgeMax) {
+        const a = data.age;
+        if (a == null || typeof a !== 'number') continue;
+        if (hasAgeMin && a < ageMinQ) continue;
+        if (hasAgeMax && a > ageMaxQ) continue;
+      }
+      if (relationshipGoalFilter && String(data.relationshipGoal || '').trim() !== relationshipGoalFilter) {
+        continue;
+      }
+      if (verifiedOnly && data.kycVerified !== true) continue;
       withDistance.push({ id: d.id, ...data, distanceKm: km });
     }
     withDistance.sort((a, b) => a.distanceKm - b.distanceKm);
@@ -853,7 +916,7 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
 });
 
 // --- Discovery (suggestions) ---
-// Optional query: gender = 'Male' | 'Female' | 'Transgender' to filter by profile gender.
+// Query: genders=Male,Female (or legacy gender=), ageMin/ageMax, relationshipGoal, verifiedOnly.
 // Ranks by: incoming like/super-like, relationship goal match, distance, KYC, daily shuffle jitter.
 // Excludes: self, passed, outgoing likes, matches, blocks.
 // Discovery is allowed for all authenticated users; likes require identity verification.
@@ -861,9 +924,14 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
   try {
     const uid = req.uid;
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 50);
-    const genderFilter = (req.query.gender || '').toString().trim();
-    const allowedGenders = ['Male', 'Female', 'Transgender', 'Non-binary', 'Prefer not to say'];
-    const gender = allowedGenders.includes(genderFilter) ? genderFilter : null;
+    const clientGenders = parseDiscoveryClientGenders(req);
+    const ageMinQ = parseInt(req.query.ageMin, 10);
+    const ageMaxQ = parseInt(req.query.ageMax, 10);
+    const hasAgeMin = !Number.isNaN(ageMinQ);
+    const hasAgeMax = !Number.isNaN(ageMaxQ);
+    const goalRaw = (req.query.relationshipGoal || '').toString().trim();
+    const relationshipGoalFilter = RELATIONSHIP_GOAL_FILTER_ALLOWED.includes(goalRaw) ? goalRaw : null;
+    const verifiedOnly = req.query.verifiedOnly === '1' || req.query.verifiedOnly === 'true';
 
     const [meSnap, excluded, incomingLikes] = await Promise.all([
       db.collection('users').doc(uid).get(),
@@ -878,10 +946,28 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
     const interestedRaw = Array.isArray(me.interestedIn) ? me.interestedIn : [];
     const interested = sanitizeInterestedIn(interestedRaw);
 
+    const fullGenderSet = clientGenders.length === DISCOVERY_CLIENT_GENDERS.length;
+    const useClientGenders = clientGenders.length > 0 && !fullGenderSet;
+
+    let effectiveQueryGenders = null;
+    if (useClientGenders) {
+      if (interested.length > 0) {
+        effectiveQueryGenders = clientGenders.filter((g) => interested.includes(g));
+      } else {
+        effectiveQueryGenders = clientGenders;
+      }
+      if (effectiveQueryGenders.length === 0) {
+        return res.json({ suggestions: [] });
+      }
+    }
+
     let query = db.collection('users').where('profileComplete', '==', true);
-    const clientGender = gender;
-    if (clientGender) {
-      query = query.where('gender', '==', clientGender);
+    if (effectiveQueryGenders != null) {
+      if (effectiveQueryGenders.length === 1) {
+        query = query.where('gender', '==', effectiveQueryGenders[0]);
+      } else {
+        query = query.where('gender', 'in', effectiveQueryGenders.slice(0, 10));
+      }
     } else if (interested.length === 1) {
       query = query.where('gender', '==', interested[0]);
     } else if (interested.length > 1) {
@@ -901,7 +987,19 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
       if (interested.length > 0 && !interested.includes(theirGender)) {
         continue;
       }
-      if (clientGender && theirGender !== clientGender) {
+      if (useClientGenders && !clientGenders.includes(theirGender)) {
+        continue;
+      }
+      if (hasAgeMin || hasAgeMax) {
+        const a = data.age;
+        if (a == null || typeof a !== 'number') continue;
+        if (hasAgeMin && a < ageMinQ) continue;
+        if (hasAgeMax && a > ageMaxQ) continue;
+      }
+      if (relationshipGoalFilter && String(data.relationshipGoal || '').trim() !== relationshipGoalFilter) {
+        continue;
+      }
+      if (verifiedOnly && data.kycVerified !== true) {
         continue;
       }
       let score = 0;
@@ -950,20 +1048,25 @@ app.post('/api/likes', requireAuth, async (req, res) => {
     if (!me.exists || !me.data().kycVerified) {
       return res.status(403).json({ error: 'Complete identity verification to like profiles.' });
     }
-    const { targetId, superLike } = req.body;
+    const { targetId, superLike, compliment } = req.body;
     if (!targetId) return res.status(400).json({ error: 'targetId required' });
+    let complimentOut =
+      typeof compliment === 'string' ? compliment.trim().slice(0, 280) : '';
+    if (complimentOut.length === 0) complimentOut = '';
     if (targetId === uid) {
       return res.status(400).json({ error: 'Invalid target' });
     }
     if (await isBlockedPair(uid, targetId)) {
       return res.status(403).json({ error: 'You cannot interact with this profile.' });
     }
-    await db.collection('likes').doc(`${uid}_${targetId}`).set({
+    const likeDoc = {
       fromId: uid,
       toId: targetId,
       superLike: !!superLike,
       createdAt: new Date().toISOString(),
-    });
+    };
+    if (complimentOut) likeDoc.compliment = complimentOut;
+    await db.collection('likes').doc(`${uid}_${targetId}`).set(likeDoc);
     bustDiscoveryPrepCacheForUsers(uid, targetId);
 
     // Check for mutual like: target has already liked uid
@@ -1074,9 +1177,14 @@ app.get('/api/likes/incoming', requireAuth, async (req, res) => {
       const userDoc = await db.collection('users').doc(fromId).get();
       if (!userDoc.exists) continue;
       const u = userDoc.data();
+      const c =
+        typeof data.compliment === 'string' && data.compliment.trim()
+          ? data.compliment.trim().slice(0, 280)
+          : null;
       list.push({
         fromId,
         superLike: !!data.superLike,
+        compliment: c,
         createdAt: data.createdAt || null,
         displayName: u.displayName || 'Someone',
         photos: Array.isArray(u.photos) ? u.photos : [],
@@ -1190,10 +1298,18 @@ async function deleteMatchAndMessages(matchId) {
 const EPHEMERAL_IMAGE_MAX_BYTES = 380000;
 const EPHEMERAL_VOICE_MAX_BYTES = 260000;
 
+/** Read `ephemeral` even if the client/proxy used different key casing. */
+function readEphemeralNested(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined;
+  if (Object.prototype.hasOwnProperty.call(body, 'ephemeral')) return body.ephemeral;
+  const key = Object.keys(body).find((k) => k.toLowerCase() === 'ephemeral');
+  return key ? body[key] : undefined;
+}
+
 /** Normalize client body for disappearing media (handles nested object, JSON string, or flat keys). */
 function normalizeEphemeralPayload(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  let e = body.ephemeral;
+  let e = readEphemeralNested(body);
   if (typeof e === 'string') {
     try {
       e = JSON.parse(e);
@@ -1204,7 +1320,13 @@ function normalizeEphemeralPayload(body) {
   if (e && typeof e === 'object' && !Array.isArray(e)) {
     return e;
   }
-  const k = body.ephemeralKind || body.kind;
+  const rawK = body.ephemeralKind ?? body.kind;
+  const k =
+    typeof rawK === 'string'
+      ? rawK.trim().toLowerCase()
+      : typeof rawK === 'number'
+        ? String(rawK)
+        : '';
   if (k === 'voice' || k === 'image') {
     const data = body.data ?? body.ephemeralData ?? body.payload;
     const mimeType = body.mimeType ?? body.ephemeralMimeType;
@@ -1263,8 +1385,14 @@ app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
     const ephemeral = normalizeEphemeralPayload(body);
 
     if (ephemeral) {
-      const kind =
-        ephemeral.kind === 'voice' ? 'voice' : ephemeral.kind === 'image' ? 'image' : null;
+      const rawKind = ephemeral.kind;
+      const kindLower =
+        typeof rawKind === 'string'
+          ? rawKind.trim().toLowerCase()
+          : rawKind != null
+            ? String(rawKind).trim().toLowerCase()
+            : '';
+      const kind = kindLower === 'voice' ? 'voice' : kindLower === 'image' ? 'image' : null;
       const mimeType = typeof ephemeral.mimeType === 'string' ? ephemeral.mimeType.trim() : '';
       const dataRaw = ephemeral.data;
       const data = typeof dataRaw === 'string' ? dataRaw.replace(/\s/g, '') : '';
@@ -1277,12 +1405,15 @@ app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
       } catch {
         return res.status(400).json({ error: 'invalid base64' });
       }
+      if (!buf || buf.length === 0) {
+        return res.status(400).json({ error: 'empty media payload' });
+      }
       const max = kind === 'voice' ? EPHEMERAL_VOICE_MAX_BYTES : EPHEMERAL_IMAGE_MAX_BYTES;
       if (buf.length > max) {
         return res.status(400).json({ error: `ephemeral ${kind} too large (max ${max} bytes)` });
       }
       if (kind === 'image') {
-        if (!/^image\/(jpeg|jpg|png|webp)$/i.test(mimeType)) {
+        if (!/^image\/(jpeg|jpg|jpe|png|webp|pjpeg|x-png)$/i.test(mimeType)) {
           return res.status(400).json({ error: 'unsupported image mime' });
         }
       } else if (
@@ -1319,7 +1450,22 @@ app.post('/api/chats/:matchId/messages', requireAuth, async (req, res) => {
       });
     }
 
-    if (!text?.trim()) return res.status(400).json({ error: 'text required' });
+    if (!text?.trim()) {
+      const hinted =
+        body &&
+        typeof body === 'object' &&
+        (readEphemeralNested(body) != null ||
+          ['kind', 'data', 'mimeType', 'ephemeralKind', 'ephemeralData'].some((k) =>
+            Object.prototype.hasOwnProperty.call(body, k),
+          ));
+      if (hinted) {
+        return res.status(400).json({
+          error:
+            'Could not read disappearing media. Update the app and ensure the API server is on the latest version.',
+        });
+      }
+      return res.status(400).json({ error: 'text required' });
+    }
     const ref = db.collection('matches').doc(matchId).collection('messages').doc();
     const now = new Date().toISOString();
     await ref.set({
@@ -1369,12 +1515,166 @@ async function canCreateRoom(uid) {
   return gender === 'female' || isPremium;
 }
 
+/** 0–100 “fit” score for host when reviewing a join request (goal, KYC, distance). */
+function meetupRequestInterestPercent(hostData, requesterData) {
+  let score = 42;
+  const hostGoal = String(hostData.relationshipGoal || '').trim().toLowerCase();
+  const reqGoal = String(requesterData.relationshipGoal || '').trim().toLowerCase();
+  if (hostGoal && reqGoal && hostGoal === reqGoal) score += 28;
+  if (requesterData.kycVerified === true) score += 15;
+  const hLat = hostData.latitude;
+  const hLng = hostData.longitude;
+  const rLat = requesterData.latitude;
+  const rLng = requesterData.longitude;
+  if (
+    hLat != null &&
+    hLng != null &&
+    rLat != null &&
+    rLng != null &&
+    !Number.isNaN(Number(hLat)) &&
+    !Number.isNaN(Number(hLng)) &&
+    !Number.isNaN(Number(rLat)) &&
+    !Number.isNaN(Number(rLng))
+  ) {
+    const km = haversineKm(Number(hLat), Number(hLng), Number(rLat), Number(rLng));
+    score += Math.max(0, 20 - km / 6);
+  }
+  return Math.min(100, Math.round(score));
+}
+
+async function attachMyRequestStatuses(uid, rooms) {
+  if (!uid || !rooms.length) return;
+  const ids = rooms.map((r) => r.id).filter(Boolean);
+  const statusMap = new Map();
+  for (let i = 0; i < ids.length; i += 30) {
+    const chunk = ids.slice(i, i + 30);
+    const snap = await db
+      .collection('room_requests')
+      .where('requesterId', '==', uid)
+      .where('roomId', 'in', chunk)
+      .get();
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      statusMap.set(d.roomId, d.status || 'pending');
+    }
+  }
+  for (const r of rooms) {
+    if (statusMap.has(r.id)) r.myRequestStatus = statusMap.get(r.id);
+  }
+}
+
+function filterRoomDocsByQuery(docs, activityType, roomType) {
+  let out = docs;
+  if (activityType) {
+    out = out.filter((doc) => (doc.data().activityType || '') === activityType);
+  }
+  if (roomType === 'group' || roomType === 'personal') {
+    out = out.filter((doc) => (doc.data().roomType || 'personal') === roomType);
+  }
+  return out;
+}
+
+function sortRoomDocsByDistance(docs, lat, lng) {
+  if (lat == null || lng == null || Number.isNaN(lat) || Number.isNaN(lng)) return docs;
+  const scored = docs.map((doc) => {
+    const d = doc.data();
+    const rLat = d.latitude;
+    const rLng = d.longitude;
+    if (rLat == null || rLng == null || Number.isNaN(Number(rLat)) || Number.isNaN(Number(rLng))) {
+      return { doc, dist: 1e9 };
+    }
+    return { doc, dist: haversineKm(lat, lng, Number(rLat), Number(rLng)) };
+  });
+  scored.sort((a, b) => a.dist - b.dist);
+  return scored.map((x) => x.doc);
+}
+
+/** Same as [sortRoomDocsByDistance] for enriched room JSON objects (e.g. saved list). */
+function sortRoomsJsonByDistance(rooms, lat, lng) {
+  if (lat == null || lng == null || Number.isNaN(lat) || Number.isNaN(lng)) return rooms;
+  const scored = rooms.map((r) => {
+    const rLat = r.latitude;
+    const rLng = r.longitude;
+    if (rLat == null || rLng == null || Number.isNaN(Number(rLat)) || Number.isNaN(Number(rLng))) {
+      return { r, dist: 1e9 };
+    }
+    return { r, dist: haversineKm(lat, lng, Number(rLat), Number(rLng)) };
+  });
+  scored.sort((a, b) => a.dist - b.dist);
+  return scored.map((x) => x.r);
+}
+
+async function fetchRoomSnapsByIdsInOrder(roomIds) {
+  const map = new Map();
+  for (let i = 0; i < roomIds.length; i += 30) {
+    const chunk = roomIds.slice(i, i + 30);
+    const refs = chunk.map((id) => db.collection('rooms').doc(id));
+    const snaps = await db.getAll(...refs);
+    for (const s of snaps) {
+      if (s.exists) map.set(s.id, s);
+    }
+  }
+  return roomIds.map((id) => map.get(id)).filter(Boolean);
+}
+
 // List rooms: discovery feed (default) or my events (mine=1, owner only)
 app.get('/api/rooms', requireAuth, async (req, res) => {
   try {
     const uid = req.uid;
     const mine = req.query.mine === '1' || req.query.mine === 'true';
+    const savedOnly = req.query.saved === '1' || req.query.saved === 'true';
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 50);
+    const activityTypeQ = (req.query.activityType || '').toString().trim() || null;
+    const roomTypeQ = (req.query.roomType || '').toString().trim();
+    const roomTypeFilter = roomTypeQ === 'group' || roomTypeQ === 'personal' ? roomTypeQ : null;
+    const sortDistance = (req.query.sort || '').toString().toLowerCase() === 'distance';
+    let viewerLat = parseFloat(req.query.lat);
+    let viewerLng = parseFloat(req.query.lng);
+    if (sortDistance && (Number.isNaN(viewerLat) || Number.isNaN(viewerLng))) {
+      const meSnap = await db.collection('users').doc(uid).get();
+      const md = meSnap.exists ? meSnap.data() : {};
+      viewerLat = md.latitude != null ? Number(md.latitude) : NaN;
+      viewerLng = md.longitude != null ? Number(md.longitude) : NaN;
+    }
+
+    if (savedOnly) {
+      const saveSnap = await db
+        .collection('users')
+        .doc(uid)
+        .collection('meetupSaves')
+        .orderBy('savedAt', 'desc')
+        .limit(limit)
+        .get();
+      const roomIds = saveSnap.docs.map((d) => d.id);
+      const snaps = await fetchRoomSnapsByIdsInOrder(roomIds);
+      const enrichRoomDocs = async (docs) => {
+        const ownerIds = [...new Set(docs.map((doc) => doc.data().ownerId).filter(Boolean))];
+        const owners = await fetchUserDocsByIds(ownerIds);
+        return docs.map((doc) => {
+          const d = doc.data();
+          const u = d.ownerId ? owners.get(d.ownerId) : null;
+          const ownerName = u ? (u.displayName || 'Host') : 'Host';
+          return {
+            id: doc.id,
+            ...d,
+            ownerName,
+            ownerProfile: meetupOwnerPublicProfile(d.ownerId, u),
+            currentParticipants: (d.participants || []).length,
+            isSaved: true,
+          };
+        });
+      };
+      let rooms = await enrichRoomDocs(snaps);
+      // Saved + mine lists are never narrowed by discovery filters (activity / room type).
+      if (roomTypeFilter) {
+        rooms = rooms.filter((r) => (r.roomType || 'personal') === roomTypeFilter);
+      }
+      if (sortDistance && !Number.isNaN(viewerLat) && !Number.isNaN(viewerLng)) {
+        rooms = sortRoomsJsonByDistance(rooms, viewerLat, viewerLng);
+      }
+      await attachMyRequestStatuses(uid, rooms);
+      return res.json({ rooms });
+    }
 
     if (mine) {
       // Only event owner sees their created rooms (any status)
@@ -1434,20 +1734,26 @@ app.get('/api/rooms', requireAuth, async (req, res) => {
       const byId = new Map();
       for (const doc of snapOpen.docs) byId.set(doc.id, doc);
       for (const doc of snapFull.docs) byId.set(doc.id, doc);
-      const activeDocs = [...byId.values()].filter((doc) => {
+      let activeDocs = [...byId.values()].filter((doc) => {
         const d = doc.data();
         const st = d.status || 'open';
         if (st === 'ended' || st === 'cancelled') return false;
         const t = new Date(d.eventAt || 0).getTime();
         return t >= nowMs;
       });
-      activeDocs.sort((a, b) => {
-        const ta = new Date(a.data().eventAt || 0).getTime();
-        const tb = new Date(b.data().eventAt || 0).getTime();
-        return ta - tb;
-      });
+      activeDocs = filterRoomDocsByQuery(activeDocs, activityTypeQ, roomTypeFilter);
+      if (sortDistance && !Number.isNaN(viewerLat) && !Number.isNaN(viewerLng)) {
+        activeDocs = sortRoomDocsByDistance(activeDocs, viewerLat, viewerLng);
+      } else {
+        activeDocs.sort((a, b) => {
+          const ta = new Date(a.data().eventAt || 0).getTime();
+          const tb = new Date(b.data().eventAt || 0).getTime();
+          return ta - tb;
+        });
+      }
       const slice = activeDocs.slice(0, limit);
       const rooms = await enrichRoomDocs(slice);
+      await attachMyRequestStatuses(uid, rooms);
       return res.json({ rooms });
     }
 
@@ -1462,13 +1768,20 @@ app.get('/api/rooms', requireAuth, async (req, res) => {
     for (const doc of snapCancelled.docs) pastById.set(doc.id, doc);
     for (const doc of snapOpenPast.docs) pastById.set(doc.id, doc);
     for (const doc of snapFullPast.docs) pastById.set(doc.id, doc);
-    const pastDocs = [...pastById.values()].sort((a, b) => {
-      const ta = new Date(b.data().eventAt || 0).getTime();
-      const tb = new Date(a.data().eventAt || 0).getTime();
-      return ta - tb;
-    });
+    let pastDocs = [...pastById.values()];
+    pastDocs = filterRoomDocsByQuery(pastDocs, activityTypeQ, roomTypeFilter);
+    if (sortDistance && !Number.isNaN(viewerLat) && !Number.isNaN(viewerLng)) {
+      pastDocs = sortRoomDocsByDistance(pastDocs, viewerLat, viewerLng);
+    } else {
+      pastDocs.sort((a, b) => {
+        const ta = new Date(b.data().eventAt || 0).getTime();
+        const tb = new Date(a.data().eventAt || 0).getTime();
+        return ta - tb;
+      });
+    }
     const pastSlice = pastDocs.slice(0, limit);
     const rooms = await enrichRoomDocs(pastSlice);
+    await attachMyRequestStatuses(uid, rooms);
     return res.json({ rooms });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1506,6 +1819,10 @@ app.get('/api/rooms/:roomId', requireAuth, async (req, res) => {
       } else {
         payload.myRequestStatus = null;
       }
+      const saveSnap = await db.collection('users').doc(uid).collection('meetupSaves').doc(roomId).get();
+      payload.isSaved = saveSnap.exists;
+    } else {
+      payload.isSaved = false;
     }
     res.json(payload);
   } catch (e) {
@@ -1540,6 +1857,50 @@ app.put('/api/rooms/:roomId/close', requireAuth, async (req, res) => {
       ownerName,
       currentParticipants: (d.participants || []).length,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Bookmark meetup (saved list)
+app.post('/api/rooms/:roomId/save', requireAuth, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const roomDoc = await db.collection('rooms').doc(roomId).get();
+    if (!roomDoc.exists) return res.status(404).json({ error: 'Room not found' });
+    await db
+      .collection('users')
+      .doc(req.uid)
+      .collection('meetupSaves')
+      .doc(roomId)
+      .set({ savedAt: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/rooms/:roomId/save', requireAuth, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    await db.collection('users').doc(req.uid).collection('meetupSaves').doc(roomId).delete();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/me/meetup-saved-ids', requireAuth, async (req, res) => {
+  try {
+    const lim = Math.min(parseInt(req.query.limit || '100', 10), 200);
+    const snap = await db
+      .collection('users')
+      .doc(req.uid)
+      .collection('meetupSaves')
+      .orderBy('savedAt', 'desc')
+      .limit(lim)
+      .get();
+    res.json({ roomIds: snap.docs.map((d) => d.id) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1665,6 +2026,16 @@ app.get('/api/rooms/:roomId/requests', requireAuth, async (req, res) => {
     const list = snapshot.docs
       .map((d) => ({ id: d.id, ...d.data() }))
       .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+    const hostSnap = await db.collection('users').doc(roomDoc.data().ownerId).get();
+    const hostData = hostSnap.exists ? hostSnap.data() : {};
+    const requesterIds = [...new Set(list.map((r) => r.requesterId).filter(Boolean))];
+    const requesters = await fetchUserDocsByIds(requesterIds);
+    for (const item of list) {
+      const rd = requesters.get(item.requesterId);
+      if (rd) {
+        item.interestMatchPercent = meetupRequestInterestPercent(hostData, rd);
+      }
+    }
     res.json({ requests: list });
   } catch (e) {
     res.status(500).json({ error: e.message });
