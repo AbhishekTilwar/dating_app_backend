@@ -946,15 +946,17 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
     const interestedRaw = Array.isArray(me.interestedIn) ? me.interestedIn : [];
     const interested = sanitizeInterestedIn(interestedRaw);
 
-    const fullGenderSet = clientGenders.length === DISCOVERY_CLIENT_GENDERS.length;
-    const useClientGenders = clientGenders.length > 0 && !fullGenderSet;
+    // Always honor explicit `genders=` from the client (including when all three are sent).
+    // Previously "all three" skipped the client filter and only used interestedIn, which
+    // made Discover ignore the filter sheet and show people outside the chosen genders.
+    const useClientGenders = clientGenders.length > 0;
 
     let effectiveQueryGenders = null;
     if (useClientGenders) {
       if (interested.length > 0) {
         effectiveQueryGenders = clientGenders.filter((g) => interested.includes(g));
       } else {
-        effectiveQueryGenders = clientGenders;
+        effectiveQueryGenders = [...clientGenders];
       }
       if (effectiveQueryGenders.length === 0) {
         return res.json({ suggestions: [] });
