@@ -5,7 +5,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
+import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import { getStorage } from 'firebase-admin/storage';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
@@ -287,6 +287,7 @@ const DISCOVERY_USER_FIELDS = [
   'locationVisible',
   'latitude',
   'longitude',
+  'likesReceivedCount',
 ];
 
 const INTERESTED_IN_ALLOWED = ['Male', 'Female', 'Transgender'];
@@ -953,8 +954,37 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
 
 // --- Discovery (suggestions) ---
 // Query: genders=Male,Female (or legacy gender=), ageMin/ageMax, relationshipGoal, verifiedOnly.
-// Ranks by: incoming like/super-like, relationship goal match, distance, KYC, daily shuffle jitter.
+// Ranks by: global likesReceivedCount (soft), relationship goal, distance, KYC, jitter; incoming
+// likes are a small score bump but [reorderDiscoverySuggestions] surfaces them after the first ~2 cards.
 // Excludes: self, passed, outgoing likes, matches, blocks.
+
+function reorderDiscoverySuggestions(scoredRows, incomingMap, limit) {
+  const incoming = new Set(incomingMap.keys());
+  const rest = [];
+  const likedMe = [];
+  for (const row of scoredRows) {
+    if (incoming.has(row.id)) likedMe.push(row);
+    else rest.push(row);
+  }
+  const out = [];
+  let ri = 0;
+  let li = 0;
+  while (out.length < 2 && out.length < limit) {
+    if (ri < rest.length) out.push(rest[ri++]);
+    else if (li < likedMe.length) out.push(likedMe[li++]);
+    else break;
+  }
+  while (out.length < limit && (ri < rest.length || li < likedMe.length)) {
+    if (ri < rest.length) out.push(rest[ri++]);
+    if (out.length >= limit) break;
+    if (li < likedMe.length) out.push(likedMe[li++]);
+    if (out.length >= limit) break;
+    if (ri < rest.length) out.push(rest[ri++]);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 // Discovery is allowed for all authenticated users; likes require identity verification.
 app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
   try {
@@ -1047,8 +1077,12 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
       }
       let score = 0;
       if (incomingLikes.has(id)) {
-        score += 100;
-        if (incomingLikes.get(id)) score += 28;
+        score += 12;
+        if (incomingLikes.get(id)) score += 6;
+      }
+      const lc = Number(data.likesReceivedCount);
+      if (Number.isFinite(lc) && lc > 0) {
+        score += Math.min(42, 6 * Math.log(1 + lc));
       }
       const theirGoal = String(data.relationshipGoal || '').trim().toLowerCase();
       if (myGoal && theirGoal && myGoal === theirGoal) score += 22;
@@ -1071,7 +1105,8 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
     }
 
     scored.sort((a, b) => b.score - a.score);
-    const list = scored.slice(0, limit).map(({ id, data }) => {
+    const ordered = reorderDiscoverySuggestions(scored, incomingLikes, limit);
+    const list = ordered.map(({ id, data }) => {
       const displayName = discoveryPublicDisplayName(data);
       const { showFullName: _sf, ...rest } = data;
       return { id, ...rest, displayName };
@@ -1110,6 +1145,10 @@ app.post('/api/likes', requireAuth, async (req, res) => {
     };
     if (complimentOut) likeDoc.compliment = complimentOut;
     await db.collection('likes').doc(`${uid}_${targetId}`).set(likeDoc);
+    await db
+      .collection('users')
+      .doc(targetId)
+      .set({ likesReceivedCount: FieldValue.increment(1) }, { merge: true });
     bustDiscoveryPrepCacheForUsers(uid, targetId);
 
     // Check for mutual like: target has already liked uid
@@ -1231,6 +1270,7 @@ app.get('/api/likes/incoming', requireAuth, async (req, res) => {
         createdAt: data.createdAt || null,
         displayName: u.displayName || 'Someone',
         photos: Array.isArray(u.photos) ? u.photos : [],
+        gender: typeof u.gender === 'string' && u.gender.trim() ? u.gender.trim() : null,
       });
     }
     res.json({ incoming: list });

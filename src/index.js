@@ -5,7 +5,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
+import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import { getStorage } from 'firebase-admin/storage';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
@@ -287,6 +287,7 @@ const DISCOVERY_USER_FIELDS = [
   'locationVisible',
   'latitude',
   'longitude',
+  'likesReceivedCount',
 ];
 
 const INTERESTED_IN_ALLOWED = ['Male', 'Female', 'Transgender'];
@@ -323,7 +324,31 @@ function parseDiscoveryClientGenders(req) {
   } else if (rawSingle) {
     parts = [rawSingle];
   }
-  return [...new Set(parts.filter((g) => DISCOVERY_CLIENT_GENDERS.includes(g)))];
+  return [...new Set(parts.map((p) => normalizeDiscoveryGender(p)).filter(Boolean))];
+}
+
+/** Map stored / legacy gender strings to Male | Female | Transgender for filters & scoring. */
+function normalizeDiscoveryGender(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (DISCOVERY_CLIENT_GENDERS.includes(s)) return s;
+  const lower = s.toLowerCase();
+  if (lower === 'male' || lower === 'm' || lower === 'man' || lower === 'guy') return 'Male';
+  if (lower === 'female' || lower === 'f' || lower === 'woman' || lower === 'girl') return 'Female';
+  if (lower === 'transgender' || lower === 'trans') return 'Transgender';
+  return '';
+}
+
+/** Firestore `in` / `==` values so rows stored as `female` vs `Female` still match (max 10 for `in`). */
+function firestoreGenderQueryValues(canonicalList) {
+  const out = [];
+  for (const c of canonicalList) {
+    if (!c || !DISCOVERY_CLIENT_GENDERS.includes(c)) continue;
+    out.push(c);
+    const low = c.toLowerCase();
+    if (low !== c) out.push(low);
+  }
+  return [...new Set(out)].slice(0, 10);
 }
 
 const PROFILE_GENDERS_ALLOWED = [
@@ -344,7 +369,18 @@ function parseNearbyGendersFilter(req) {
   } else if (rawSingle) {
     parts = [rawSingle];
   }
-  const g = [...new Set(parts.filter((x) => PROFILE_GENDERS_ALLOWED.includes(x)))];
+  const g = [
+    ...new Set(
+      parts
+        .map((x) => {
+          const t = String(x || '').trim();
+          if (PROFILE_GENDERS_ALLOWED.includes(t)) return t;
+          const canon = normalizeDiscoveryGender(t);
+          return canon || t;
+        })
+        .filter((x) => PROFILE_GENDERS_ALLOWED.includes(x)),
+    ),
+  ];
   return g.length ? g : null;
 }
 
@@ -541,14 +577,43 @@ async function getHuman() {
   return _human;
 }
 
+/**
+ * Decode JPEG to RGB Uint8Array. jpeg-js often returns RGBA (4 bytes/px); Human/tfjs expects [H,W,3].
+ */
+async function jpegBufferToRgb(buffer) {
+  const jpegMod = await import('jpeg-js');
+  const decode = jpegMod.decode ?? jpegMod.default?.decode ?? jpegMod.default;
+  if (typeof decode !== 'function') {
+    throw new Error('jpeg-js decode() not found');
+  }
+  const { width, height, data } = decode(buffer, { useTArray: true });
+  if (!data || width < 10 || height < 10) throw new Error('Invalid image');
+  const px = width * height;
+  const expectedRgb = px * 3;
+  const expectedRgba = px * 4;
+  if (data.length === expectedRgb) {
+    return { width, height, rgb: data };
+  }
+  if (data.length === expectedRgba) {
+    const rgb = new Uint8Array(expectedRgb);
+    for (let i = 0, o = 0; o < expectedRgb; i += 4, o += 3) {
+      rgb[o] = data[i];
+      rgb[o + 1] = data[i + 1];
+      rgb[o + 2] = data[i + 2];
+    }
+    return { width, height, rgb };
+  }
+  throw new Error(
+    `Unexpected decoded JPEG size ${data.length} for ${width}x${height} (expected ${expectedRgb} or ${expectedRgba})`,
+  );
+}
+
 /** Decode JPEG buffer to tensor [1, height, width, 3] for Human (pure JS, no canvas). */
 async function bufferToTensor(buffer) {
-  const jpeg = await import('jpeg-js');
-  const { width, height, data } = jpeg.decode(buffer, { useTArray: true });
-  if (!data || width < 10 || height < 10) throw new Error('Invalid image');
+  const { width, height, rgb } = await jpegBufferToRgb(buffer);
   const human = await getHuman();
   return human.tf.tidy(() => {
-    const tensor = human.tf.tensor3d(data, [height, width, 3]).expandDims(0);
+    const tensor = human.tf.tensor3d(rgb, [height, width, 3]).expandDims(0);
     return human.tf.cast(tensor, 'float32');
   });
 }
@@ -893,8 +958,9 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
       if (userLat == null || userLng == null) continue;
       const km = haversineKm(lat, lng, userLat, userLng);
       if (km > radiusKm) continue;
-      const g = String(data.gender || '');
-      if (gendersFilter && !gendersFilter.includes(g)) continue;
+      const rawG = String(data.gender || '').trim();
+      const gMatch = normalizeDiscoveryGender(rawG) || rawG;
+      if (gendersFilter && !gendersFilter.includes(gMatch)) continue;
       if (hasAgeMin || hasAgeMax) {
         const a = data.age;
         if (a == null || typeof a !== 'number') continue;
@@ -917,8 +983,36 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
 
 // --- Discovery (suggestions) ---
 // Query: genders=Male,Female (or legacy gender=), ageMin/ageMax, relationshipGoal, verifiedOnly.
-// Ranks by: incoming like/super-like, relationship goal match, distance, KYC, daily shuffle jitter.
+// Ranks by: global likesReceivedCount (soft), relationship goal, distance, KYC, jitter; incoming
+// likes are a small score bump but [reorderDiscoverySuggestions] surfaces them after the first ~2 cards.
 // Excludes: self, passed, outgoing likes, matches, blocks.
+function reorderDiscoverySuggestions(scoredRows, incomingMap, limit) {
+  const incoming = new Set(incomingMap.keys());
+  const rest = [];
+  const likedMe = [];
+  for (const row of scoredRows) {
+    if (incoming.has(row.id)) likedMe.push(row);
+    else rest.push(row);
+  }
+  const out = [];
+  let ri = 0;
+  let li = 0;
+  while (out.length < 2 && out.length < limit) {
+    if (ri < rest.length) out.push(rest[ri++]);
+    else if (li < likedMe.length) out.push(likedMe[li++]);
+    else break;
+  }
+  while (out.length < limit && (ri < rest.length || li < likedMe.length)) {
+    if (ri < rest.length) out.push(rest[ri++]);
+    if (out.length >= limit) break;
+    if (li < likedMe.length) out.push(likedMe[li++]);
+    if (out.length >= limit) break;
+    if (ri < rest.length) out.push(rest[ri++]);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 // Discovery is allowed for all authenticated users; likes require identity verification.
 app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
   try {
@@ -965,10 +1059,14 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
 
     let query = db.collection('users').where('profileComplete', '==', true);
     if (effectiveQueryGenders != null) {
-      if (effectiveQueryGenders.length === 1) {
-        query = query.where('gender', '==', effectiveQueryGenders[0]);
+      const gVals = firestoreGenderQueryValues(effectiveQueryGenders);
+      if (gVals.length === 0) {
+        return res.json({ suggestions: [] });
+      }
+      if (gVals.length === 1) {
+        query = query.where('gender', '==', gVals[0]);
       } else {
-        query = query.where('gender', 'in', effectiveQueryGenders.slice(0, 10));
+        query = query.where('gender', 'in', gVals.slice(0, 10));
       }
     } else if (interested.length === 1) {
       query = query.where('gender', '==', interested[0]);
@@ -985,7 +1083,8 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
       const id = d.id;
       if (excluded.has(id)) continue;
       const data = d.data();
-      const theirGender = String(data.gender || '');
+      const theirGender = normalizeDiscoveryGender(data.gender);
+      if (!theirGender) continue;
       if (interested.length > 0 && !interested.includes(theirGender)) {
         continue;
       }
@@ -1006,8 +1105,12 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
       }
       let score = 0;
       if (incomingLikes.has(id)) {
-        score += 100;
-        if (incomingLikes.get(id)) score += 28;
+        score += 12;
+        if (incomingLikes.get(id)) score += 6;
+      }
+      const lc = Number(data.likesReceivedCount);
+      if (Number.isFinite(lc) && lc > 0) {
+        score += Math.min(42, 6 * Math.log(1 + lc));
       }
       const theirGoal = String(data.relationshipGoal || '').trim().toLowerCase();
       if (myGoal && theirGoal && myGoal === theirGoal) score += 22;
@@ -1030,7 +1133,8 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
     }
 
     scored.sort((a, b) => b.score - a.score);
-    const list = scored.slice(0, limit).map(({ id, data }) => {
+    const ordered = reorderDiscoverySuggestions(scored, incomingLikes, limit);
+    const list = ordered.map(({ id, data }) => {
       const displayName = discoveryPublicDisplayName(data);
       const { showFullName: _sf, ...rest } = data;
       return { id, ...rest, displayName };
@@ -1069,6 +1173,10 @@ app.post('/api/likes', requireAuth, async (req, res) => {
     };
     if (complimentOut) likeDoc.compliment = complimentOut;
     await db.collection('likes').doc(`${uid}_${targetId}`).set(likeDoc);
+    await db
+      .collection('users')
+      .doc(targetId)
+      .set({ likesReceivedCount: FieldValue.increment(1) }, { merge: true });
     bustDiscoveryPrepCacheForUsers(uid, targetId);
 
     // Check for mutual like: target has already liked uid
@@ -1190,6 +1298,7 @@ app.get('/api/likes/incoming', requireAuth, async (req, res) => {
         createdAt: data.createdAt || null,
         displayName: u.displayName || 'Someone',
         photos: Array.isArray(u.photos) ? u.photos : [],
+        gender: typeof u.gender === 'string' && u.gender.trim() ? u.gender.trim() : null,
       });
     }
     res.json({ incoming: list });
