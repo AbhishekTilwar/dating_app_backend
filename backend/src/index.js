@@ -323,7 +323,31 @@ function parseDiscoveryClientGenders(req) {
   } else if (rawSingle) {
     parts = [rawSingle];
   }
-  return [...new Set(parts.filter((g) => DISCOVERY_CLIENT_GENDERS.includes(g)))];
+  return [...new Set(parts.map((p) => normalizeDiscoveryGender(p)).filter(Boolean))];
+}
+
+/** Map stored / legacy gender strings to Male | Female | Transgender for filters & scoring. */
+function normalizeDiscoveryGender(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (DISCOVERY_CLIENT_GENDERS.includes(s)) return s;
+  const lower = s.toLowerCase();
+  if (lower === 'male' || lower === 'm' || lower === 'man' || lower === 'guy') return 'Male';
+  if (lower === 'female' || lower === 'f' || lower === 'woman' || lower === 'girl') return 'Female';
+  if (lower === 'transgender' || lower === 'trans') return 'Transgender';
+  return '';
+}
+
+/** Firestore `in` / `==` values so rows stored as `female` vs `Female` still match (max 10 for `in`). */
+function firestoreGenderQueryValues(canonicalList) {
+  const out = [];
+  for (const c of canonicalList) {
+    if (!c || !DISCOVERY_CLIENT_GENDERS.includes(c)) continue;
+    out.push(c);
+    const low = c.toLowerCase();
+    if (low !== c) out.push(low);
+  }
+  return [...new Set(out)].slice(0, 10);
 }
 
 const PROFILE_GENDERS_ALLOWED = [
@@ -344,7 +368,18 @@ function parseNearbyGendersFilter(req) {
   } else if (rawSingle) {
     parts = [rawSingle];
   }
-  const g = [...new Set(parts.filter((x) => PROFILE_GENDERS_ALLOWED.includes(x)))];
+  const g = [
+    ...new Set(
+      parts
+        .map((x) => {
+          const t = String(x || '').trim();
+          if (PROFILE_GENDERS_ALLOWED.includes(t)) return t;
+          const canon = normalizeDiscoveryGender(t);
+          return canon || t;
+        })
+        .filter((x) => PROFILE_GENDERS_ALLOWED.includes(x)),
+    ),
+  ];
   return g.length ? g : null;
 }
 
@@ -893,8 +928,9 @@ app.get('/api/nearby', requireAuth, async (req, res) => {
       if (userLat == null || userLng == null) continue;
       const km = haversineKm(lat, lng, userLat, userLng);
       if (km > radiusKm) continue;
-      const g = String(data.gender || '');
-      if (gendersFilter && !gendersFilter.includes(g)) continue;
+      const rawG = String(data.gender || '').trim();
+      const gMatch = normalizeDiscoveryGender(rawG) || rawG;
+      if (gendersFilter && !gendersFilter.includes(gMatch)) continue;
       if (hasAgeMin || hasAgeMax) {
         const a = data.age;
         if (a == null || typeof a !== 'number') continue;
@@ -946,15 +982,17 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
     const interestedRaw = Array.isArray(me.interestedIn) ? me.interestedIn : [];
     const interested = sanitizeInterestedIn(interestedRaw);
 
-    const fullGenderSet = clientGenders.length === DISCOVERY_CLIENT_GENDERS.length;
-    const useClientGenders = clientGenders.length > 0 && !fullGenderSet;
+    // Always honor explicit `genders=` from the client (including when all three are sent).
+    // Previously "all three" skipped the client filter and only used interestedIn, which
+    // made Discover ignore the filter sheet and show people outside the chosen genders.
+    const useClientGenders = clientGenders.length > 0;
 
     let effectiveQueryGenders = null;
     if (useClientGenders) {
       if (interested.length > 0) {
         effectiveQueryGenders = clientGenders.filter((g) => interested.includes(g));
       } else {
-        effectiveQueryGenders = clientGenders;
+        effectiveQueryGenders = [...clientGenders];
       }
       if (effectiveQueryGenders.length === 0) {
         return res.json({ suggestions: [] });
@@ -963,10 +1001,14 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
 
     let query = db.collection('users').where('profileComplete', '==', true);
     if (effectiveQueryGenders != null) {
-      if (effectiveQueryGenders.length === 1) {
-        query = query.where('gender', '==', effectiveQueryGenders[0]);
+      const gVals = firestoreGenderQueryValues(effectiveQueryGenders);
+      if (gVals.length === 0) {
+        return res.json({ suggestions: [] });
+      }
+      if (gVals.length === 1) {
+        query = query.where('gender', '==', gVals[0]);
       } else {
-        query = query.where('gender', 'in', effectiveQueryGenders.slice(0, 10));
+        query = query.where('gender', 'in', gVals.slice(0, 10));
       }
     } else if (interested.length === 1) {
       query = query.where('gender', '==', interested[0]);
@@ -983,7 +1025,8 @@ app.get('/api/discovery', requireAuth, discoveryLimiter, async (req, res) => {
       const id = d.id;
       if (excluded.has(id)) continue;
       const data = d.data();
-      const theirGender = String(data.gender || '');
+      const theirGender = normalizeDiscoveryGender(data.gender);
+      if (!theirGender) continue;
       if (interested.length > 0 && !interested.includes(theirGender)) {
         continue;
       }
